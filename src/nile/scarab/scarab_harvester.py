@@ -1,3 +1,92 @@
+"""SCARAB: the federated harvester.
+
+Retrieves the data a query needs from any number of repositories, loads
+it into one local triplestore, and leaves the query to be evaluated
+there.
+
+The query is broken into its triple patterns and each repository is
+asked for one pattern at a time. Patterns are requested smallest first,
+and each is constrained by what the previous ones returned -- a bind
+join -- so that little more comes back than the query can use.
+Everything retrieved is kept, whether or not the repository it came from
+can answer the rest of the query. That is what allows an answer to be
+assembled from triples no single repository held together.
+
+Usage::
+
+    from nile.scarab.scarab_harvester import (
+        FindBGPPriority, execute_sparql_query)
+
+    FindBGPPriority(query, [
+        "http://example.org/fragments",      # fragments server
+        "sparql:http://example.org/sparql",  # SPARQL endpoint
+        "dump:/data/repository.ttl",         # local RDF file
+    ])
+    results = execute_sparql_query(query)
+
+Sources
+    A bare http(s) location is read as a fragments server. A SPARQL
+    endpoint has to be declared with a "sparql:" prefix, because the two
+    cannot be told apart by their URL and mistaking one for the other
+    would quietly yield nothing at all. See `make_datasource`.
+
+Configuration
+    Read from the environment at import time::
+
+        SCARAB_STORE_BASE            local triplestore, e.g.
+                                     http://localhost:7200
+        SCARAB_STORE_REPOSITORY      repository within it
+        SCARAB_STORE_QUERY_URL       overrides the derived query URL
+        SCARAB_STORE_STATEMENTS_URL  overrides the derived statements URL
+        SCARAB_MAX_THREADS           concurrent requests per bind join
+        SCARAB_HARVEST_PATH_BASE_PREDICATES
+                                     set to "0" to stop property paths
+                                     retrieving their base predicates
+
+    Only the SPARQL protocol and the RDF graph store protocol are used,
+    so any conformant triplestore can stand in for the GraphDB
+    deployment these default to.
+
+Pattern dicts
+    A query pattern travels through the module as a dict::
+
+        {
+            "subject":   <term>,
+            "predicate": <term> or "__PATH__",
+            "object":    <term>,
+            "graph":     <term> or None,
+            "predicate_path":    rdflib path, on path patterns only,
+            "derived_from_path": str, on generated support patterns only,
+        }
+
+    Every position is a string in one canonical encoding, which the
+    request builder and the response filter both depend on::
+
+        variable     ?name
+        IRI          http://example.org/x      (bare, any scheme)
+        literal      "lex", "lex"@en, "lex"^^<datatype>   (N3 form)
+        blank node   _:label
+        path         the "__PATH__" sentinel
+
+    The N3 form for literals is what the Linked Data Fragments
+    specification expects in a fragment selector, so a request built
+    this way is correct as well as internally consistent. Note that an
+    IRI is never recognised by an "http" prefix anywhere in this module,
+    since urn:, doi: and ark: are all perfectly ordinary.
+
+Provenance
+    Each run mints one nanopublication per source. The graph the
+    harvested triples are written into *is* that nanopublication's
+    assertion graph, so nothing is stored twice. See
+    `write_nanopub_graphs`.
+
+State
+    The page cache, the ingestion queue and its daemon thread are
+    module-level and shared across the process, so one harvesting run at
+    a time per process. Progress is reported on standard output
+    throughout.
+"""
+
 # == SCARAB: Federated Harvester with Binding Propagation & Blank Node Safety ==
 #
 # Python implementation of the Ruby version with the following improvements:
@@ -124,7 +213,10 @@ _flusher_started = False
 
 
 def _ensure_flusher_running():
-    """Start the ingestion daemon exactly once per process (B.2.8)."""
+    """Start the ingestion daemon, once per process.
+
+    Safe to call repeatedly; only the first call starts a thread.
+    """
     global _flusher_started
     with _flusher_lock:
         if _flusher_started:
@@ -147,12 +239,20 @@ SCARAB_DOWNLOAD_URI = URIRef(
 # -------------------------------------------------------------------------
 
 def mint_nanopub_uri(run_id: str, endpoint_index: int) -> str:
-    """
-    Mint a stable nanopub base URI for one (run, endpoint) pair.
-    Uses uuid5 (deterministic, name-based) so reruns produce the same URI.
+    """Mint the nanopublication base URI for one run and source.
 
-    The four sub-graph IRIs are derived by appending:
-      #Head, #assertion, #provenance, #pubinfo
+    Derived from the run identifier and the source's position using UUID
+    v5, so it is stable: the same run and source always produce the same
+    URI, and separate runs never overwrite one another's records.
+
+    Args:
+        run_id: Identifier for the harvesting run.
+        endpoint_index: 1-based position of the source within the run.
+
+    Returns:
+        The base URI. The four graphs of the nanopublication are named
+        by appending "#Head", "#assertion", "#provenance" and
+        "#pubinfo".
     """
     slug = _uuid_mod.uuid5(
         _uuid_mod.NAMESPACE_URL,
@@ -189,7 +289,15 @@ _PATH_SENTINEL = "__PATH__"
 
 
 def term_to_pattern_str(term):
-    """Serialize an RDFLib term (or an already-encoded string) canonically."""
+    """Encode an rdflib term as a canonical pattern position.
+
+    Args:
+        term: An rdflib term, an already-encoded string, or None.
+
+    Returns:
+        The encoding described in the module docstring, or None for
+        None. Anything unrecognised becomes the "__PATH__" sentinel.
+    """
     if term is None:
         return None
     if isinstance(term, Variable):
@@ -206,12 +314,22 @@ def term_to_pattern_str(term):
 
 
 def parse_pattern_term(text):
-    """
-    Inverse of term_to_pattern_str.
+    """Decode a canonical pattern position back into an rdflib term.
 
-    Returns an RDFLib term, or None when `text` denotes a variable, the
-    path sentinel, or nothing at all (i.e. an unbound position that
-    imposes no restriction).
+    The inverse of `term_to_pattern_str`.
+
+    Args:
+        text: An encoded pattern position.
+
+    Returns:
+        The rdflib term, or None where the position is unbound and so
+        restricts nothing -- a variable, the path sentinel, or nothing
+        at all.
+
+    Note:
+        Anything that is not a variable, a blank node, an
+        angle-bracketed IRI or an N3 literal is read as a bare IRI,
+        whatever its scheme.
     """
     if text is None or text == _PATH_SENTINEL:
         return None
@@ -235,13 +353,23 @@ def parse_pattern_term(text):
 
 
 def pattern_term_matches(req, value):
-    """
-    True when the RDF term `value` satisfies the pattern position `req`.
+    """Return True when an RDF term satisfies a pattern position.
 
-    Comparison is by RDF term equality, not string equality, so a plain
-    literal is no longer conflated with an equally-spelled typed or
-    language-tagged literal, and a quoted request term no longer fails to
-    match the triple it was built from (B.2.1).
+    Args:
+        req: The encoded pattern position. An unbound one matches
+            anything.
+        value: The rdflib term to test.
+
+    Returns:
+        True if the term satisfies the position.
+
+    Note:
+        Comparison is by RDF term equality, not string equality, so a
+        plain literal is not conflated with an equally-spelled typed or
+        language-tagged one. IRIs get a lenient fallback on their string
+        form, for servers that echo an IRI back in a different but
+        equivalent shape. Literals do not, since their datatype and
+        language are significant.
     """
     expected = parse_pattern_term(req)
     if expected is None:
@@ -257,12 +385,15 @@ def pattern_term_matches(req, value):
 
 
 def sparql_term(text):
-    """
-    Render a canonical pattern term for inclusion in a SPARQL query.
+    """Render a canonical pattern position for use in a SPARQL query.
 
-    Variables pass through; literals are already in N3 and pass through;
-    everything else is an IRI and is angle-bracketed regardless of scheme
-    (B.2.4).
+    Args:
+        text: An encoded pattern position.
+
+    Returns:
+        Variables, blank nodes, literals and already-bracketed IRIs
+        unchanged; anything else angle-bracketed as an IRI, whatever its
+        scheme. None for None.
     """
     if text is None:
         return None
@@ -278,13 +409,19 @@ def sparql_term(text):
 
 
 def term_from_sparql_json(binding):
-    """
-    Rebuild an RDFLib term from a SPARQL-JSON binding dict.
+    """Rebuild an rdflib term from a SPARQL-JSON binding.
 
-    Used so that bindings read back out of the local store retain their
-    node kind, datatype and language tag instead of being flattened to a
-    bare string, which is what previously made a literal indistinguishable
-    from an IRI at bind-join time (B.2.1, B.2.4).
+    Lets bindings read back out of the local store keep their node kind,
+    datatype and language tag rather than being flattened to a bare
+    string -- which is exactly the information the request encoding
+    depends on.
+
+    Args:
+        binding: A SPARQL-JSON binding dict.
+
+    Returns:
+        The rdflib term. Anything that is not a dict becomes a plain
+        literal of its string form.
     """
     if not isinstance(binding, dict):
         return Literal(str(binding))
@@ -308,6 +445,24 @@ def term_from_sparql_json(binding):
 # -------------------------------------------------------------------------
 
 def extract_all_patterns(node, patterns=None, graph_term=None):
+    """Collect every triple pattern in a parsed query, with its graph.
+
+    Walks an rdflib SPARQL algebra tree, descending through OPTIONAL,
+    UNION, MINUS, FILTER and GRAPH alike. Each pattern is recorded
+    together with the graph term of the GRAPH clause it sits under, if
+    any, so patterns come back as quads rather than triples.
+
+    Args:
+        node: An algebra node, normally the root of a translated query.
+        patterns: Accumulator for the recursion. Leave unset.
+        graph_term: The graph in force at this point. Leave unset.
+
+    Returns:
+        A list of pattern dicts holding rdflib terms, not yet encoded. A
+        pattern whose predicate is a property path carries the
+        "__PATH__" sentinel, with the expression preserved under
+        "predicate_path".
+    """
     if patterns is None:
         patterns = []
     if node is None:
@@ -366,6 +521,26 @@ def extract_all_patterns(node, patterns=None, graph_term=None):
 
 
 def transform(query: str):
+    """Turn a query into the pattern dicts the harvester works from.
+
+    Parses the query, collects its patterns, encodes every position
+    canonically, and collapses duplicates -- so a pattern repeated
+    across two branches of a UNION is requested only once.
+
+    Args:
+        query: The SPARQL query.
+
+    Returns:
+        A list of pattern dicts. Empty if the query could not be parsed;
+        the error is printed rather than raised.
+
+    Note:
+        A pattern's graph term is part of its identity, so the same
+        triple pattern under two different GRAPH clauses stays two
+        patterns. So is the serialised path expression, so that two
+        distinct paths sharing a subject and an object are not collapsed
+        into one by the sentinel they share.
+    """
     with _parse_lock:
         try:
             parsed = parseQuery(query)
@@ -380,6 +555,7 @@ def transform(query: str):
     # produced an encoding incompatible with the one used at bind-join
     # time. Blank nodes and non-http IRI schemes are also handled.
     def term_to_str(term):
+        """Encode one term, falling back to the path sentinel."""
         if term is None:
             return None
         if isinstance(term, (URIRef, Literal, Variable, BNode, str)):
@@ -420,7 +596,15 @@ def transform(query: str):
     return bgp
 
 def path_to_str(path) -> str:
-    """Recursively serialize an RDFLib path expression to a string token."""
+    """Serialise a property path expression to a string.
+
+    Args:
+        path: An rdflib path expression, or a plain IRI.
+
+    Returns:
+        A readable form: "(p)*" for a modifier, "a/b" for a sequence,
+        "a|b" for an alternative, "^p" for an inverse.
+    """
     if isinstance(path, URIRef):
         return str(path)
     if isinstance(path, MulPath):
@@ -436,36 +620,47 @@ def path_to_str(path) -> str:
 
 
 def is_path_pattern(pat: dict) -> bool:
-    """
-    Returns True when a pattern's predicate is a property path expression
-    rather than a plain IRI or variable string.
-    """
+    """Return True if a pattern's predicate is a property path expression."""
     return pat.get("predicate") == "__PATH__"
 
 
 def synthetic_path_iri(path_obj) -> URIRef:
-    """
-    Build the reserved IRI under which the result of a locally evaluated
-    property path is materialized (B.2.2).
+    """Build the reserved IRI a locally-evaluated path stores results under.
 
-    path_to_str emits '^' for an inverse path and '|' for an alternative
-    path, and neither character is legal in an IRI. Concatenating the raw
-    serialization onto the urn:tpf:path: prefix therefore produced a term
-    whose n3() raised, aborting the harvest for the whole source. The
-    serialization is percent-encoded, which keeps the mapping injective
-    (so two distinct paths still receive two distinct predicates) while
-    guaranteeing a syntactically valid IRI.
+    Evaluating a property path produces pairs of resources, and those
+    pairs have to stay available to the patterns that join with the
+    path. Each is materialised as a triple using this predicate, which
+    makes the result reachable through ordinary SPARQL while the
+    reserved namespace keeps it from being mistaken for a predicate any
+    repository actually asserted.
 
-    Both the writer (harvest_endpoint_optimized) and the reader
-    (extract_upstream_bindings_graphdb) call this function, so the two
-    cannot drift apart.
+    Args:
+        path_obj: The path expression.
+
+    Returns:
+        The IRI. The serialised expression is percent-encoded, since "^"
+        and "|" are not legal in an IRI, and the encoding stays
+        one-to-one so two distinct paths still get two distinct
+        predicates.
+
+    Note:
+        Both the writer and the reader of these triples call this
+        function, so the two cannot drift apart.
     """
     return URIRef("urn:tpf:path:" + quote(path_to_str(path_obj), safe=""))
 
 
 def extract_base_iris_from_path(path) -> list:
-    """
-    Walk a path expression tree and collect every concrete IRI it references.
+    """Collect the concrete predicates a path expression references.
+
+    Args:
+        path: The path expression.
+
+    Returns:
+        The IRIs, in the order met, repeats included. Empty for a
+        negated property set, which names the predicates that must *not*
+        occur and so cannot be enumerated from a fragments interface at
+        all.
     """
     if isinstance(path, URIRef):
         return [path]
@@ -486,29 +681,32 @@ def extract_base_iris_from_path(path) -> list:
 
 
 def path_support_patterns(pat, path_index):
-    """
-    Derive the ordinary triple patterns that must be harvested before a
-    property path can be evaluated locally (B.1.3).
+    """Derive the patterns that must be harvested before a path can run.
 
-    evaluate_path_locally computes the closure over triples that are
-    already in the local store, filtered to the base predicates of the
-    path. Nothing previously scheduled the retrieval of those triples, so
-    unless a base predicate happened to appear elsewhere in the query as a
-    simple pattern, the closure was computed over an empty graph and the
-    path yielded no bindings.
+    A property path cannot be requested from a fragments server: a
+    server will return the triples for a given predicate, but not the
+    pairs of resources joined by an arbitrary-length chain of them.
+    SCARAB therefore evaluates paths locally, over triples already in
+    the store, which means the base predicates have to be fetched first.
 
-    For each distinct base IRI of the path this returns one pattern
+    Args:
+        pat: The path pattern.
+        path_index: Its position in the query, used to name variables.
 
-        ?__path{k}_{n}_s   <baseIRI>   ?__path{k}_{n}_o
+    Returns:
+        One unconstrained pattern per distinct base predicate, using
+        freshly-named variables so a derived pattern cannot join with
+        anything in the original query by accident. Each carries
+        "derived_from_path", so provenance can tell it apart from a
+        pattern of the query proper.
 
-    using fresh variable names so that the derived pattern cannot join
-    accidentally with any variable of the original query. The pattern is
-    unconstrained because a transitive or arbitrary-length path may
-    traverse intermediate resources that no binding of the query
-    constrains; retrieving the full extent of the base predicates is what
-    makes the local closure complete with respect to the harvested data.
-    Derived patterns are flagged so that provenance can distinguish them
-    from the triple patterns of the query proper.
+    Note:
+        These patterns are unconstrained deliberately. A transitive path
+        may travel through intermediate resources that nothing in the
+        query constrains, so retrieving the full extent of the base
+        predicates is what makes the local evaluation complete with
+        respect to what was harvested. It can also be expensive -- see
+        SCARAB_HARVEST_PATH_BASE_PREDICATES.
     """
     derived = []
     seen = set()
@@ -531,16 +729,24 @@ def path_support_patterns(pat, path_index):
 
 
 def augment_bgp_with_path_support(bgp):
-    """
-    Return `bgp` extended with the support patterns required by every
-    property path it contains (B.1.3).
+    """Add the support patterns every property path in a query needs.
 
-    A support pattern is suppressed when the query already requests the
-    same predicate as a simple unconstrained pattern, so that no fragment
-    is requested twice. Support patterns are ordinary simple patterns and
-    are therefore scheduled by the ordinary cardinality/connectivity rule,
-    which places them before the path patterns (paths are always appended
-    last).
+    Args:
+        bgp: The query's pattern dicts.
+
+    Returns:
+        The list, extended. A support pattern is left out where the
+        query already requests the same predicate unconstrained, so
+        nothing is fetched twice.
+
+    Note:
+        Support patterns are ordinary patterns and are scheduled by the
+        ordinary rule, which puts them before the paths -- paths are
+        always scheduled last.
+
+        Returns `bgp` untouched when SCARAB_HARVEST_PATH_BASE_PREDICATES
+        is disabled, warning first if the query contains paths, since
+        the failure mode there is a path quietly producing nothing.
     """
     if not HARVEST_PATH_BASE_PREDICATES:
         # Silent under-retrieval is the failure mode this toggle
@@ -587,6 +793,14 @@ def augment_bgp_with_path_support(bgp):
 # -------------------------------------------------------------------------
 
 def extract_vars_from_pattern(pat):
+    """List the variable names a pattern uses, without their "?".
+
+    Args:
+        pat: A pattern dict.
+
+    Returns:
+        The names, in subject, predicate, object, graph order.
+    """
     vars_ = []
     for field in ("subject", "predicate", "object", "graph"):
         val = pat.get(field)
@@ -595,6 +809,12 @@ def extract_vars_from_pattern(pat):
     return vars_
 
 def shares_variable(pat, processed_patterns):
+    """Return True if a pattern shares a variable with any of the others.
+
+    Args:
+        pat: The pattern to test.
+        processed_patterns: The patterns to test it against.
+    """
     vars = set(extract_vars_from_pattern(pat))
     for p in processed_patterns:
         if vars.intersection(extract_vars_from_pattern(p)):
@@ -603,9 +823,29 @@ def shares_variable(pat, processed_patterns):
 
 
 def evaluate_path_locally(pat: dict, named_graph: str) -> list[dict]:
-    """
-    Resolve a property-path pattern against triples already stored in
-    GraphDB, returning a list of variable-binding dicts.
+    """Evaluate a property path over what is already in the local store.
+
+    The triples for the path's base predicates are pulled out of the
+    store into an in-memory graph, and the expression is evaluated
+    against that: outwards from a fixed subject, backwards towards a
+    fixed object, or over every reachable pair when both ends are
+    variables.
+
+    Args:
+        pat: The path pattern.
+        named_graph: Graph to draw triples from, matched by prefix.
+
+    Returns:
+        One dict of variable name -> rdflib term per distinct pair
+        found. Empty if the path references no concrete predicate, or if
+        nothing has been materialised for it.
+
+    Note:
+        Because the closure is computed over materialised triples only,
+        an empty local graph always means no bindings. A warning is
+        printed in that case, since "the base predicates were never
+        retrieved" and "the repository holds no such triples" are
+        otherwise indistinguishable from the output.
     """
     path_obj  = pat["predicate_path"]
     subj_term = pat["subject"]
@@ -700,15 +940,22 @@ def evaluate_path_locally(pat: dict, named_graph: str) -> list[dict]:
 # -------------------------------------------------------------------------
 
 def triple_matches_request(s, p, o, req_s, req_p, req_o):
-    """
-    Comunica-style triple filtering.
+    """Return True when a retrieved triple satisfies the pattern requested.
 
-    B.2.1: comparison is now by RDF term equality via
-    pattern_term_matches. The previous string comparison tested the
-    N3-encoded request term ('"Aspirin"') against the plain lexical form
-    of the retrieved literal ('Aspirin'); the two never agreed, every
-    triple of the page was rejected, data_triples fell to zero and the
-    traversal terminated at the first page having ingested nothing.
+    A fragments response carries the fragment's own control metadata
+    alongside its data, so a page is filtered against the request before
+    anything is kept.
+
+    Args:
+        s: Subject of the retrieved triple.
+        p: Predicate of the retrieved triple.
+        o: Object of the retrieved triple.
+        req_s: Encoded subject position requested.
+        req_p: Encoded predicate position requested.
+        req_o: Encoded object position requested.
+
+    Returns:
+        True if the triple matches.
     """
     return (
         pattern_term_matches(req_s, s) and
@@ -718,9 +965,24 @@ def triple_matches_request(s, p, o, req_s, req_p, req_o):
 
 
 def tpf_uri_request_builder(control_uri, subject, predicate, object_, graph=None):
-    """
-    Build a TPF or QPF request URL.
-    Skips variables (starting with ?) and None values.
+    """Build the request URL for one pattern.
+
+    Variables and unset positions are left out, so an all-variable
+    pattern asks for the whole dataset and a fully-bound one asks
+    whether a single triple is present.
+
+    Args:
+        control_uri: Base URL of the fragments server.
+        subject: Encoded subject position.
+        predicate: Encoded predicate position.
+        object_: Encoded object position.
+        graph: Encoded graph position. Including it makes this a Quad
+            Pattern Fragments request; leaving it out keeps the request
+            indistinguishable from an ordinary triple-based one, so a
+            server implementing only the latter is unaffected.
+
+    Returns:
+        The URL.
     """
     params = {}
 
@@ -746,6 +1008,19 @@ def tpf_uri_request_builder(control_uri, subject, predicate, object_, graph=None
 # -------------------------------------------------------------------------
 
 def heuristic_cardinality(html):
+    """Guess a fragment's size from the response body.
+
+    A fallback for servers whose control metadata is missing or cannot
+    be read. It distinguishes only three cases: an empty fragment, one
+    advertising a further page, and one that does not.
+
+    Args:
+        html: The response body.
+
+    Returns:
+        A rough estimate. These numbers are ordering hints rather than
+        counts; they only have to rank patterns against one another.
+    """
     if re.search(r'no\s*triples', html, re.I):
         return 0
     if 'rel="next"' in html:
@@ -757,6 +1032,26 @@ def heuristic_cardinality(html):
 
 
 def get_pattern_count(control_uri, subject, predicate, object_, graph=None):
+    """Estimate how many triples a fragments server holds for a pattern.
+
+    One request is issued and the estimate read from the fragment's
+    control metadata -- hydra:totalItems or void:triples -- falling back
+    to `heuristic_cardinality` where the server publishes neither.
+
+    Args:
+        control_uri: Base URL of the fragments server.
+        subject: Encoded subject position.
+        predicate: Encoded predicate position.
+        object_: Encoded object position.
+        graph: Encoded graph position, for a QPF request.
+
+    Returns:
+        The estimate. A server that cannot be reached yields a very
+        large number rather than an error, which schedules its pattern
+        last and lets the run go on: across independently administered
+        repositories, one being unavailable should cost some
+        completeness, not the whole answer.
+    """
     url = tpf_uri_request_builder(control_uri, subject, predicate, object_, graph)
 
     try:
@@ -801,11 +1096,30 @@ METADATA_NAMESPACES = (
 )
 
 def _is_metadata_predicate(p):
+    """Return True for a predicate belonging to fragment control metadata."""
     return any(str(p).startswith(ns) for ns in METADATA_NAMESPACES)
 
 
 def fetch_tpf_page(url):
-    """Fetch and parse a TPF/QPF page. Returns full ConjunctiveGraph."""
+    """Fetch and parse one page of a fragment.
+
+    Pages are cached by URL for the life of the process, so the same
+    page is not fetched twice when two bindings of a bind join lead to
+    the same request.
+
+    TriG is preferred and Turtle accepted, but the body is parsed by
+    trying the supported serialisations in turn, so a server answering
+    in N-Triples, RDF/XML, JSON-LD or RDFa-annotated HTML stays usable.
+
+    Args:
+        url: The page URL.
+
+    Returns:
+        A ConjunctiveGraph holding the page: its data triples together
+        with the control metadata describing the fragment. Empty if the
+        page could not be fetched or parsed, the error being printed
+        rather than raised.
+    """
     with _cache_lock:
         if url in page_cache:
             return page_cache[url]
@@ -838,9 +1152,32 @@ def fetch_tpf_page(url):
 
 def harvest_pattern_into_repo(url, named_graph,
                               subject=None, predicate=None, object_=None):
-    """
-    Harvest triples from a TPF/QPF endpoint for ONE triple pattern.
-    Filters triples by the requested pattern before buffering.
+    """Follow a fragment to its end, buffering the triples that match.
+
+    Pages are followed through their hydra:next links. Each page is
+    filtered against the requested pattern before anything is buffered,
+    since a response carries the fragment's own control metadata
+    alongside its data.
+
+    Args:
+        url: URL of the first page.
+        named_graph: Graph to write the triples into.
+        subject: Encoded subject position, for filtering.
+        predicate: Encoded predicate position, for filtering.
+        object_: Encoded object position, for filtering.
+
+    Note:
+        The walk stops when a page contributes nothing, when a page
+        holds fewer triples than the server's advertised page size
+        (marking it the last), or when the next link repeats the current
+        URL -- a guard against servers whose pagination fails to
+        advance.
+
+        Correctness depends on successive pages covering the fragment
+        exactly once, which requires the server to paginate
+        deterministically. A server backed by a store that returns
+        solutions in a different order each time will silently skip some
+        triples and repeat others.
     """
     print("Harvesting URL:", url)
 
@@ -914,45 +1251,100 @@ def harvest_pattern_into_repo(url, named_graph,
 
 
 class DataSource:
-    """Common interface over TPF/QPF servers, SPARQL endpoints and dumps."""
+    """What SCARAB needs from a repository, and nothing more.
+
+    A source has to answer two questions: how many triples it holds for
+    a given pattern, and which triples those are. Everything above this
+    -- the scheduling, the bind join, the ingestion queue, the
+    nanopublication wrapper -- is identical whichever kind of repository
+    lies behind it.
+
+    The interface is this narrow because the fragments interface is the
+    most restrictive of the three supported, and writing to it means the
+    other two need no special handling: a SPARQL endpoint answers a
+    pattern request with a SELECT over that one pattern, and a dump
+    answers it by scanning the parsed graph.
+
+    Attributes:
+        kind: Short name of the source type, used in labels and
+            provenance.
+        location: Where the repository lives.
+    """
 
     kind = "abstract"
 
     def __init__(self, location):
+        """Bind to one location.
+
+        Args:
+            location: URL or file path of the repository.
+        """
         self.location = location
 
     # -- provenance -------------------------------------------------------
     def identity_uri(self):
-        """The IRI by which this source is denoted in the provenance graph."""
+        """Return the IRI denoting this source in the provenance graph."""
         return URIRef(self.location)
 
     def provenance_type(self):
-        """(rdf:type, access-property) used to describe the source."""
+        """Return the type and access property describing this source.
+
+        Returns:
+            An (rdf:type, access property) pair.
+        """
         return DCAT.DataService, DCAT.endpointURL
 
     def label(self):
+        """Return a short human-readable description of the source."""
         return f"{self.kind}: {self.location}"
 
     # -- retrieval --------------------------------------------------------
     def count(self, pat):
+        """Estimate how many triples this source holds for a pattern.
+
+        Args:
+            pat: The pattern dict.
+
+        Returns:
+            The estimate, used only to rank patterns against one
+            another.
+
+        Raises:
+            NotImplementedError: Always. Subclasses provide this.
+        """
         raise NotImplementedError
 
     def harvest(self, pat, named_graph):
+        """Buffer every triple this source holds for a pattern.
+
+        Args:
+            pat: The pattern dict.
+            named_graph: Graph to write the triples into.
+
+        Raises:
+            NotImplementedError: Always. Subclasses provide this.
+        """
         raise NotImplementedError
 
 
 class TPFDataSource(DataSource):
-    """
-    Triple/Quad Pattern Fragments server.
+    """A Triple or Quad Pattern Fragments server.
 
-    Behaviour is exactly that of the previous implementation: the pattern
-    is encoded as a fragment selector, the cardinality is read from the
-    control metadata, and the fragment is traversed page by page.
+    The interface the rest of the design is written against. A pattern
+    becomes a fragment selector, the size estimate comes from the
+    fragment's control metadata, and the fragment is walked page by
+    page.
+
+    A fragments server is cheap to put in front of an existing
+    repository and exposes far less than a SPARQL endpoint does, which
+    matters wherever a data custodian is willing to publish the shape of
+    their data but not an unrestricted query interface.
     """
 
     kind = "tpf"
 
     def count(self, pat):
+        """Read the fragment's size estimate from its control metadata."""
         return get_pattern_count(
             self.location,
             pat["subject"],
@@ -962,6 +1354,7 @@ class TPFDataSource(DataSource):
         )
 
     def harvest(self, pat, named_graph):
+        """Walk the fragment for a pattern, buffering what matches."""
         url = tpf_uri_request_builder(
             self.location,
             pat["subject"],
@@ -979,24 +1372,31 @@ class TPFDataSource(DataSource):
 
 
 class SPARQLDataSource(DataSource):
-    """
-    Remote SPARQL endpoint used as a source of triple patterns.
+    """A remote SPARQL endpoint, asked one pattern at a time.
 
-    The endpoint is never asked to evaluate the query: it is asked for one
-    triple pattern at a time, exactly as a fragment server would be. This
-    keeps the retrieval-before-evaluation property of the suite intact,
-    and means an endpoint that can answer only part of the query still
-    contributes everything it holds for the patterns it can answer.
+    The endpoint is never handed the query. It is asked for one triple
+    pattern at a time, exactly as a fragments server would be, which
+    keeps retrieval separate from evaluation whichever kind of source is
+    involved and means an endpoint able to answer only part of a query
+    still contributes everything it holds for the rest.
 
-    The graph component is handled symmetrically with SPHINX: a pattern
-    carrying a concrete graph IRI is scoped with GRAPH, and a pattern with
-    no graph term is matched against the default graph OR any named graph,
-    so that content is found wherever the repository chose to put it.
+    Graphs are handled as SPHINX handles them: a pattern carrying a
+    concrete graph IRI is scoped with GRAPH, and one carrying none is
+    matched against the default graph or any named graph, so content is
+    found wherever the repository chose to put it.
     """
 
     kind = "sparql"
 
     def _where_clause(self, pat):
+        """Build the WHERE clause matching one pattern, correctly scoped.
+
+        Args:
+            pat: The pattern dict.
+
+        Returns:
+            The clause.
+        """
         s = sparql_term(pat["subject"])
         p = sparql_term(pat["predicate"])
         o = sparql_term(pat["object"])
@@ -1010,7 +1410,17 @@ class SPARQLDataSource(DataSource):
         return f"{{ {core} }} UNION {{ GRAPH ?__g {{ {core} }} }}"
 
     def _projection(self, pat):
-        """Project the variable positions; bound positions are echoed back."""
+        """Return the pattern's three positions, keyed by role.
+
+        Args:
+            pat: The pattern dict.
+
+        Returns:
+            A dict of "subject", "predicate" and "object".
+
+        Note:
+            Not used by `harvest`, which builds its projection inline.
+        """
         return {
             "subject":   pat["subject"],
             "predicate": pat["predicate"],
@@ -1018,6 +1428,17 @@ class SPARQLDataSource(DataSource):
         }
 
     def count(self, pat):
+        """Count the triples the endpoint holds for a pattern.
+
+        Args:
+            pat: The pattern dict.
+
+        Returns:
+            The count, or a very large number where the endpoint could
+            not be reached or answered unusably -- which schedules the
+            pattern last and lets the run go on, exactly as an
+            unreachable fragments server is treated.
+        """
         query = f"""
 SELECT (COUNT(*) AS ?__count) WHERE {{
   {self._where_clause(pat)}
@@ -1034,6 +1455,17 @@ SELECT (COUNT(*) AS ?__count) WHERE {{
             return 999_999_999
 
     def harvest(self, pat, named_graph):
+        """Select the triples matching a pattern and buffer them.
+
+        Args:
+            pat: The pattern dict.
+            named_graph: Graph to write the triples into.
+
+        Note:
+            Blank nodes are skipped. One retrieved from a remote source
+            has no identity outside the document that produced it, so it
+            could not be joined against anything afterwards.
+        """
         s_var = pat["subject"].startswith("?")
         p_var = pat["predicate"].startswith("?")
         o_var = pat["object"].startswith("?")
@@ -1094,24 +1526,39 @@ SELECT DISTINCT {projection} WHERE {{
 
 
 class DumpDataSource(DataSource):
-    """
-    Local RDF dump file.
+    """A local RDF file.
 
-    The dump is parsed once, on first use, into an in-memory
-    ConjunctiveGraph so that a quad-based serialization (N-Quads, TriG)
-    retains its named graphs and can be addressed by a pattern carrying a
-    graph term, exactly as the QPF interface allows.
+    Parsed once, on first use, into an in-memory ConjunctiveGraph, so a
+    quad-based serialisation keeps its named graphs and can be addressed
+    by a pattern carrying a graph term, exactly as the QPF interface
+    allows.
+
+    Counting a pattern scans the whole graph, so a large file is better
+    loaded into a triplestore and declared as a SPARQL source.
     """
 
     kind = "dump"
 
     def __init__(self, location, rdf_format=None):
+        """Bind to one file, without reading it yet.
+
+        Args:
+            location: Path or URL of the RDF file.
+            rdf_format: Serialisation name for rdflib. Guessed if
+                omitted.
+        """
         super().__init__(location)
         self.rdf_format = rdf_format
         self._graph = None
         self._load_lock = threading.Lock()
 
     def identity_uri(self):
+        """Return the file's IRI, for provenance.
+
+        Returns:
+            An absolute file:// URI where the location resolves to a
+            path on disk, and the location unchanged where it does not.
+        """
         try:
             return URIRef(_FsPath(self.location).resolve().as_uri())
         except Exception:
@@ -1120,9 +1567,17 @@ class DumpDataSource(DataSource):
 
     def provenance_type(self):
         # A dump is a distribution, not a service.
+        """Describe a dump as a dataset rather than as a service."""
         return DCAT.Dataset, DCAT.downloadURL
 
     def _ensure_loaded(self):
+        """Parse the file, once.
+
+        Returns:
+            The parsed graph. A file that cannot be parsed yields an
+            empty graph and a printed error, so one bad dump does not
+            cost the other sources of the run.
+        """
         with self._load_lock:
             if self._graph is not None:
                 return self._graph
@@ -1139,6 +1594,15 @@ class DumpDataSource(DataSource):
             return self._graph
 
     def _matching(self, pat):
+        """Yield the triples matching a pattern.
+
+        Args:
+            pat: The pattern dict. A concrete graph term restricts the
+                scan to that named graph.
+
+        Yields:
+            Matching (subject, predicate, object) triples.
+        """
         cg = self._ensure_loaded()
 
         graph = pat.get("graph")
@@ -1156,9 +1620,19 @@ class DumpDataSource(DataSource):
             yield s, p, o
 
     def count(self, pat):
+        """Count the matching triples, by scanning the whole graph."""
         return sum(1 for _ in self._matching(pat))
 
     def harvest(self, pat, named_graph):
+        """Buffer every triple matching a pattern.
+
+        Args:
+            pat: The pattern dict.
+            named_graph: Graph to write the triples into.
+
+        Note:
+            Blank nodes are skipped, as for every other source type.
+        """
         print(f"Harvesting dump source: {self.location}")
         buffered = 0
         for s, p, o in self._matching(pat):
@@ -1177,22 +1651,34 @@ _DUMP_EXTENSIONS = (
 
 
 def make_datasource(spec):
-    """
-    Build a DataSource from a caller-supplied specification.
+    """Build a DataSource from a caller's description of a repository.
 
-    Accepted forms:
+    Args:
+        spec: One of
 
-      {"type": "tpf"|"sparql"|"dump", "location": ..., "format": ...}
-      "tpf:<url>"        an explicit TPF/QPF server
-      "sparql:<url>"     an explicit SPARQL endpoint
-      "dump:<path>"      an explicit RDF dump
-      "<path-or-url>"    inferred
+            - a DataSource, returned unchanged
+            - {"type": "tpf"|"sparql"|"dump", "location": ...,
+              "format": ...}
+            - "tpf:<url>" or "qpf:<url>", a fragments server
+            - "sparql:<url>", a SPARQL endpoint
+            - "dump:<path>", an RDF file
+            - a bare path or URL, inferred
 
-    Inference is deliberately conservative: a bare http(s) URL is taken to
-    be a TPF/QPF server, which preserves the behaviour of every existing
-    caller, and a SPARQL endpoint must therefore be declared explicitly.
-    Anything carrying a recognised RDF file extension, or a file:// URL,
-    or an existing path on disk, is taken to be a dump.
+    Returns:
+        The DataSource.
+
+    Raises:
+        ValueError: If a dict names an unknown type, or if `spec` is
+            neither a string nor a dict.
+
+    Note:
+        Inference is deliberately cautious. Anything with a recognised
+        RDF extension, a file:// URL, or a path that exists on disk is
+        taken for a dump; anything else http(s) for a fragments server.
+        A SPARQL endpoint therefore has to declare itself, since it
+        cannot be told from a fragments server by its URL alone and
+        mistaking one for the other would produce empty fragments rather
+        than an error.
     """
     if isinstance(spec, DataSource):
         return spec
@@ -1238,15 +1724,24 @@ def make_datasource(spec):
 # -------------------------------------------------------------------------
 
 def concretize_pattern(pat, binding):
-    """
-    Substitute a binding into a pattern, returning a new pattern dict.
+    """Substitute a binding into a pattern.
 
-    B.2.1: the canonical encoder is used for every position, so a bound
-    literal is rendered in its N3 form both in the request sent to the
-    source and in the filter applied to the response. The two are the same
-    string, which is what makes the round trip work.
+    Args:
+        pat: The pattern dict.
+        binding: Variable name -> rdflib term.
+
+    Returns:
+        A new pattern dict with the bound variables replaced. Variables
+        the binding says nothing about are left alone.
+
+    Note:
+        Every position goes through the canonical encoder, so a bound
+        literal is rendered identically in the request sent to the
+        source and in the filter applied to its response. That they are
+        the same string is what makes the round trip work.
     """
     def concretize(term):
+        """Replace one position if the binding covers it."""
         if term is None or not term.startswith("?"):
             return term
         var_name = term[1:]
@@ -1263,10 +1758,34 @@ def concretize_pattern(pat, binding):
 
 
 def fetch_binding(binding, pat, source, named_graph):
+    """Harvest one pattern under one binding.
+
+    Args:
+        binding: Variable name -> rdflib term.
+        pat: The pattern dict.
+        source: The DataSource to ask.
+        named_graph: Graph to write the triples into.
+    """
     source.harvest(concretize_pattern(pat, binding), named_graph)
 
 
 def fetch_binding_batch(batch, pat, source, named_graph):
+    """Harvest one pattern under a batch of bindings, concurrently.
+
+    Requests run on a bounded pool sized by SCARAB_MAX_THREADS. The
+    batch size is a multiple of the pool size, so the pool stays busy
+    for the whole batch.
+
+    Args:
+        batch: The bindings.
+        pat: The pattern dict.
+        source: The DataSource to ask.
+        named_graph: Graph to write the triples into.
+
+    Note:
+        Blocks until every request in the batch has finished. An
+        exception raised by any of them propagates.
+    """
     with ThreadPoolExecutor(MAX_THREADS) as pool:
         futures = []
         for binding in batch:
@@ -1285,9 +1804,21 @@ def term_matches(pattern_term, triple_term):
     # B.2.1/B.2.4: shares the canonical comparison used by the fragment
     # filter, so the in-memory binding extractor cannot disagree with the
     # store-backed one about what a literal or a non-http IRI looks like.
+    """Return True when a term satisfies a pattern position.
+
+    Shares the canonical comparison the fragment filter uses, so the
+    in-memory binding extractor cannot disagree with the store-backed
+    one about what a literal or a non-http IRI looks like.
+    """
     return pattern_term_matches(pattern_term, triple_term)
 
 def triple_matches_pattern(triple, pat):
+    """Return True when a triple satisfies every position of a pattern.
+
+    Args:
+        triple: The (subject, predicate, object) terms.
+        pat: The pattern dict.
+    """
     s, p, o = triple
     if not term_matches(pat["subject"], s):
         return False
@@ -1298,6 +1829,24 @@ def triple_matches_pattern(triple, pat):
     return True
 
 def extract_upstream_bindings(repo, current_idx, harvested, bgp):
+    """Read join bindings out of an in-memory collection of triples.
+
+    Args:
+        repo: The triples to read from.
+        current_idx: Index of the pattern about to be harvested.
+        harvested: Indices of the patterns harvested already.
+        bgp: All of the query's pattern dicts.
+
+    Returns:
+        One dict of variable name -> rdflib term per distinct binding.
+        Empty when nothing has been harvested yet, or when the pattern
+        shares no variable with what has.
+
+    Note:
+        The harvesting path uses `extract_upstream_bindings_graphdb`
+        instead, which asks the local store the same question. This
+        variant is kept for callers holding their triples in memory.
+    """
     if not harvested:
         return []
 
@@ -1360,6 +1909,35 @@ def extract_upstream_bindings(repo, current_idx, harvested, bgp):
 
 
 def extract_upstream_bindings_graphdb(current_idx, harvested, bgp, graph_iri):
+    """Read join bindings for the next pattern out of the local store.
+
+    Before a pattern is requested, the store is asked what the
+    already-harvested patterns bind its shared variables to. Those
+    bindings are what turn an unconstrained request into a bind join.
+
+    Args:
+        current_idx: Index of the pattern about to be harvested.
+        harvested: Indices of the patterns harvested already.
+        bgp: All of the query's pattern dicts.
+        graph_iri: Graph to read from, which confines the bindings to
+            one source's contribution. A falsy value reads from
+            everywhere.
+
+    Returns:
+        One dict of variable name -> rdflib term per row. Empty when
+        nothing has been harvested yet, when the pattern shares no
+        variable with what has, or when the query failed -- in which
+        case the failure is printed and the pattern is then requested
+        unconstrained.
+
+    Note:
+        Bindings come back typed, so a literal keeps its datatype and
+        language tag and can be re-encoded correctly for the next
+        request.
+
+        A property path pattern already harvested is read through the
+        synthetic predicate its results were stored under.
+    """
     if not harvested:
         return []
 
@@ -1436,6 +2014,22 @@ def extract_upstream_bindings_graphdb(current_idx, harvested, bgp, graph_iri):
 # -------------------------------------------------------------------------
 
 def build_query(statements, named_graph=None):
+    """Build an INSERT DATA update for a batch of triples.
+
+    Args:
+        statements: The (subject, predicate, object) triples.
+        named_graph: Graph to insert into. Omitted for the default
+            graph.
+
+    Returns:
+        The update, as a string.
+
+    Note:
+        Ingestion itself goes through the queue and
+        `buffer_flusher_daemon`, which posts N-Quads to the graph store
+        endpoint rather than issuing updates. This is here for callers
+        that want an update instead.
+    """
     triples = "\n".join(
         f"{s.n3()} {p.n3()} {o.n3()} ." for s, p, o in statements
     )
@@ -1456,7 +2050,20 @@ INSERT DATA {{
 
 
 def insert_triples_stream(statements, named_graph=None):
-    """Send triples directly to the local store as RDF (N-Triples or N-Quads)."""
+    """Post a batch of triples straight to the local store.
+
+    A synchronous alternative to the ingestion queue, bypassing the
+    buffer entirely.
+
+    Args:
+        statements: The (subject, predicate, object) triples.
+        named_graph: Graph to write into. Omitted for the default graph.
+
+    Note:
+        Failures are printed, not raised. The harvesting path uses
+        `add_to_buffer` instead, so this is for callers writing outside
+        a run.
+    """
     endpoint = STORE_STATEMENTS_URL  # B.2.8: configured, not hard-coded
     lines = []
     for s, p, o in statements:
@@ -1486,7 +2093,18 @@ def insert_triples_stream(statements, named_graph=None):
 # -------------------------------------------------------------------------
 
 def add_to_buffer(triple, named_graph=None):
-    """Push triple into ingestion queue (blocking if full)."""
+    """Queue one triple for ingestion.
+
+    Args:
+        triple: The (subject, predicate, object) terms.
+        named_graph: Graph to write it into.
+
+    Note:
+        Blocks when the queue is full, which is the point: it puts
+        backpressure on the harvesting threads rather than letting an
+        unbounded buffer grow in memory. That matters for the
+        unconstrained fragments a federated query can produce.
+    """
     s, p, o = triple
 
     if named_graph:
@@ -1498,6 +2116,22 @@ def add_to_buffer(triple, named_graph=None):
 
 
 def buffer_flusher_daemon():
+    """Drain the ingestion queue into the local store, forever.
+
+    Runs on a daemon thread, started once per process by
+    `_ensure_flusher_running`. Triples come off the queue in batches and
+    are posted as N-Quads, retrying with a growing delay when a post
+    fails.
+
+    Note:
+        A batch still failing after its retries is dropped and the loss
+        reported. Nothing is raised, there being no caller to raise to.
+
+        Callers needing their triples to be visible should join the
+        queue rather than sleep. The harvester does this between
+        patterns, so that every triple harvested for one pattern is
+        visible to the bindings extracted for the next.
+    """
     endpoint = STORE_STATEMENTS_URL  # B.2.8: configured, not hard-coded
     BATCH_SIZE = 500
     MAX_RETRIES = 3
@@ -1557,22 +2191,38 @@ def write_nanopub_graphs(
     started_at: str,
     ended_at: str,
 ):
-    """
-    Write the three non-data nanopub graphs (Head, provenance, pubinfo)
-    directly to the local store as n-quads.
+    """Write the provenance wrapper around one source's harvest.
 
-    Called AFTER _ingest_queue.join() so all data triples are guaranteed
-    to be in the assertion graph before provenance is written.
+    A nanopublication is four named graphs sharing a base IRI: a head
+    naming the other three, an assertion holding the content, a
+    provenance describing how the assertion came about, and a pubinfo
+    holding administrative metadata. This writes three of them. The
+    assertion graph is the graph the harvested triples were already
+    written into, so nothing is copied and one graph serves at once as
+    the triples' location and as the nanopublication's assertion.
 
-    The assertion graph is already populated by the buffer flusher —
-    this function only adds the provenance wrapper around it.
+    The provenance records the source, the activity that read it, the
+    patterns that directed the reading, and SCARAB itself at two levels:
+    the codebase as a software agent, and the running instance as an
+    agent attributed to it.
 
-    `source` is a DataSource. The source is described according to its
-    kind: a TPF/QPF server or SPARQL endpoint is a dcat:DataService
-    identified by its dcat:endpointURL, whereas an RDF dump is a
-    dcat:Dataset identified by its dcat:downloadURL. In every case the
-    description distinguishes the resource that was consumed from SCARAB
-    itself, which is the agent that performed the harvest.
+    Args:
+        nanopub_base: Base IRI, from `mint_nanopub_uri`.
+        source: The DataSource harvested. A fragments server or SPARQL
+            endpoint is described as a service identified by its
+            endpoint URL, a dump as a dataset identified by its download
+            URL -- so the record says not only which source contributed
+            what, but through what kind of interface.
+        bgp: The query's pattern dicts. Support patterns generated for a
+            property path are labelled as such, so provenance does not
+            present them as patterns of the query.
+        started_at: When the harvest began, as an xsd:dateTime string.
+        ended_at: When it finished.
+
+    Note:
+        Call only once the ingestion queue has drained, so that the
+        assertion graph is complete before anything claims to describe
+        it. All the graphs go to the store in a single request.
     """
 
     source = make_datasource(source)
@@ -1711,21 +2361,41 @@ def write_nanopub_graphs(
 # -------------------------------------------------------------------------
 
 def harvest_endpoint_optimized(source, bgp, nanopub_base):
-    """
-    Harvest all BGP patterns from one source into the nanopub's assertion
-    graph, then write the nanopub provenance wrapper.
+    """Harvest every pattern of a query from one source.
 
-    `source` is a DataSource — a TPF/QPF server, a SPARQL endpoint or an
-    RDF dump. The scheduling, bind join, ingestion and provenance
-    behaviour is identical for all three; only count() and harvest()
-    differ. A bare string is still accepted and is resolved through
-    make_datasource, so existing callers are unaffected.
+    Patterns are ordered before anything is requested. The one estimated
+    smallest goes first; each subsequent step prefers a pattern sharing
+    a variable with those already scheduled, taking the smallest among
+    them, and lifts that restriction only when nothing left is
+    connected. The order therefore favours both selectivity and
+    connectivity, so small fragments arrive first and the bindings they
+    yield constrain what follows. Property paths are always last, since
+    they are evaluated over whatever the rest of the query materialised.
 
-    The assertion graph IRI is derived from nanopub_base:
-        named_graph = nanopub_base + "#assertion"
+    Each pattern is then requested: unconstrained if nothing binds its
+    variables yet, or once per binding if something does -- a bind join,
+    issued in concurrent batches. The ingestion queue is drained between
+    patterns, so each pattern's triples are visible to the next one's
+    bindings.
 
-    This replaces the old `named_graph` parameter so the assertion graph
-    IS the nanopub assertion graph — no duplication, no separate copy.
+    Args:
+        source: The DataSource, or anything `make_datasource` accepts.
+        bgp: The query's pattern dicts.
+        nanopub_base: Base IRI for this run and source. The assertion
+            graph is this plus "#assertion", and is where the harvested
+            triples go.
+
+    Returns:
+        None. What the call produces is the triples now in the local
+        store and the provenance wrapper written around them.
+
+    Note:
+        Setting the module-level INDEXING_MODE to True turns on a strict
+        mode, in which a pattern sharing variables with earlier ones but
+        for which no binding could be found is skipped rather than
+        harvested in full. It is meant for exploratory indexing, where
+        the cost of an unconstrained fragment is not worth paying. Off
+        by default, and nothing in the suite turns it on.
     """
 
     source = make_datasource(source)
@@ -1857,6 +2527,40 @@ def harvest_endpoint_optimized(source, bgp, nanopub_base):
 
 def FindBGPPriority(query, endpoints, base_named_graph=None):
     # B.2.8: started once per process rather than once per call.
+    """Harvest a query's data from every source into the local store.
+
+    The entry point. The query is broken into patterns, support patterns
+    are added for any property paths, and each source is harvested in
+    turn into its own nanopublication assertion graph.
+
+    The query itself is never rewritten. The decomposition governs
+    retrieval only, and the query's semantics -- its OPTIONAL, UNION,
+    MINUS and FILTER clauses, all of which harvesting ignores -- are
+    applied afterwards by the local store, over everything harvested.
+
+    Args:
+        query: The SPARQL query.
+        endpoints: The sources. A single source may be given on its own.
+            Each may be a URL, a prefixed string, a dict or a
+            DataSource; see `make_datasource`.
+        base_named_graph: Identifier for this run, which the assertion
+            graph IRIs are derived from. Defaults to "urn:tpf:run", so
+            passing a fresh one per run is what keeps runs apart.
+
+    Returns:
+        None. Query the local store afterwards, with
+        `execute_sparql_query`, to get the answers.
+
+    Note:
+        Returns early, having done nothing, if the query cannot be
+        parsed or yields no patterns.
+
+        Each source harvests into its own assertion graph, and the
+        bindings constraining its requests are read back from that graph
+        alone, so a source's contribution is gathered in isolation from
+        the others. They are combined only at the end, when the query is
+        evaluated over everything the run gathered.
+    """
     _ensure_flusher_running()
 
     if isinstance(endpoints, (str, dict, DataSource)):
@@ -1905,29 +2609,26 @@ def FindBGPPriority(query, endpoints, base_named_graph=None):
 # -------------------------------------------------------------------------
 
 def execute_sparql_query(query, include_types=False, endpoint=None):
-    """
-    Execute a SPARQL query and return its solutions.
+    """Run a SPARQL query and return its solutions.
 
-    include_types=False (default): each binding is flattened to its plain
-    string value, as used by the callers that only need to compare or
-    print a value.
+    Args:
+        query: The query.
+        include_types: How each binding comes back. False flattens it to
+            its plain string value, which is enough for callers that
+            only compare or print. True keeps the full SPARQL-JSON dict,
+            so a caller can tell an IRI from a blank node or a literal
+            without guessing from the string -- which SPHINX's TPF
+            adapter needs in order not to mistake a blank-node class for
+            a real one, and which the bind join needs in order to
+            re-encode a literal with its datatype intact.
+        endpoint: Where to send it. Defaults to the local store; passing
+            one explicitly is what lets `SPARQLDataSource` reuse this
+            against a remote source.
 
-    include_types=True: each binding is kept as the full SPARQL-JSON dict
-    ({"type": "uri"|"bnode"|"literal"|..., "value": ..., optional
-    "datatype"/"xml:lang"}), so callers can tell a URI/IRI term from a
-    blank node or a literal without guessing from the string. This is what
-    SPHINX's TPFAdapter requires in order not to mistake a blank-node
-    class for a resolvable class IRI, and what the bind join requires in
-    order to re-serialize a literal with its datatype intact.
-
-    B.2.7: this parameter previously existed only in the copy of this
-    module that lived alongside the indexer. Merging it here is what
-    allows that copy to be deleted and both modules to share one
-    back-end.
-
-    endpoint: defaults to the local store. Passing an explicit endpoint is
-    what allows SPARQLDataSource to reuse this function against a remote
-    source; the local store remains the default for every other caller.
+    Returns:
+        A list of solutions, or None if the query failed. That is None
+        rather than an empty list, so a caller distinguishing failure
+        from no results should test for it.
     """
     endpoint = endpoint or STORE_QUERY_URL  # B.2.8: configured
 
@@ -1962,6 +2663,32 @@ def execute_sparql_query(query, include_types=False, endpoint=None):
 
 
 def run_query_strict(query, endpoints, base_named_graph="urn:tpf:temp"):
+    """Harvest a query and hand back the triples, unevaluated.
+
+    Runs a harvest under a fresh run identifier and reads back
+    everything it gathered. Used by SPHINX's TPF adapter, which wants
+    the triples themselves rather than an answer to the query.
+
+    Args:
+        query: The SPARQL query.
+        endpoints: The sources; see `make_datasource`.
+        base_named_graph: Prefix for the run identifier.
+
+    Returns:
+        A list of (subject, predicate, object) triples, each term a
+        SPARQL-JSON dict so that its node kind survives. Empty if no
+        source was given, or if nothing was harvested.
+
+    Note:
+        The run's assertion graphs are recomputed here rather than
+        searched for, which works because `mint_nanopub_uri` is
+        deterministic in the run and the source's position. It is also
+        exact: it cannot pick up an assertion graph belonging to another
+        run, as a substring test over a shared prefix could.
+
+        Despite the name, this does not enable INDEXING_MODE. A caller
+        wanting that strict skipping behaviour has to set it itself.
+    """
     run_id = str(_uuid_mod.uuid4())
     graph_base = f"{base_named_graph}/{run_id}"
 

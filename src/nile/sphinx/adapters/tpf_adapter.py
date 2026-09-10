@@ -1,3 +1,19 @@
+"""Indexing a repository through its fragments interface.
+
+A Triple Pattern Fragments server answers requests for one triple
+pattern at a time and does nothing else, so the exploration queries the
+other adapters issue have to be taken apart, requested pattern by
+pattern, and reassembled locally. That work is done by SCARAB's
+harvester, which this module drives through `run_query_strict` -- one
+piece of retrieval machinery serves both modules.
+
+Fragments responses carry control metadata describing the fragment
+itself alongside the data. Anything in the Hydra, VoID or SPARQL service
+description vocabularies is therefore filtered out, so that a server's
+own bookkeeping does not end up in the index as if it were repository
+content.
+"""
+
 # B.2.7: single shared back-end. This previously imported from a copy of
 # the harvester that lived alongside the indexer and had diverged from the
 # SCARAB copy (it carried execute_sparql_query(include_types=...) which
@@ -15,36 +31,71 @@ METADATA_PREFIXES = (
 )
 
 def _is_metadata_predicate(p: str) -> bool:
+    """Return True for a predicate belonging to fragment control metadata."""
     return any(p.startswith(ns) for ns in METADATA_PREFIXES)
 
 def _is_metadata_class(c: str) -> bool:
+    """Return True for a class belonging to fragment control metadata."""
     return any(c.startswith(ns) for ns in METADATA_PREFIXES)
 
 
 def _term_value(term):
-    """Plain string value of a run_query_strict term dict, or the term
-    itself if it is already a plain string (defensive fallback)."""
+    """Return the plain string value of a term.
+
+    Args:
+        term: A SPARQL-JSON term dict, or already a plain string.
+
+    Returns:
+        The term's lexical value, or "" if there is none.
+    """
     if isinstance(term, dict):
         return term.get("value", "")
     return str(term) if term is not None else ""
 
 
 def _is_uri_term(term) -> bool:
-    """
-    True only if `term` is a run_query_strict binding for a URI/IRI
-    (term["type"] == "uri"). Blank nodes and literals are rejected here
-    based on the actual SPARQL-JSON binding type, not on a string-prefix
-    guess -- see TPF.execute_sparql_query(include_types=True).
+    """Return True only for a term dict denoting an IRI.
+
+    Blank nodes and literals are rejected on the strength of the term's
+    declared type, not on what its string happens to look like.
     """
     return isinstance(term, dict) and term.get("type") == "uri"
 
 
 class TPFAdapter:
+    """Explores a repository through a fragments server.
+
+    Each exploration step is written as a SPARQL query for readability,
+    but it is never sent anywhere as one. `run_query_strict` breaks it
+    into triple pattern requests, harvests the fragments into the local
+    store and hands back the triples; this adapter then works out the
+    classes and relationships from those triples itself.
+
+    Expect this to be slower than asking a SPARQL endpoint the same
+    question, since the work an endpoint would have done is being done
+    here instead.
+
+    See `nile.sphinx.adapters` for the contract the adapters share.
+    """
+
     def __init__(self, endpoint):
+        """Bind the adapter to one fragments server.
+
+        Args:
+            endpoint: Base URL of the TPF or QPF server.
+        """
         self.endpoint = endpoint
 
     @staticmethod
     def normalize_iri(value: str) -> str:
+        """Strip the angle brackets from an IRI, if it has any.
+
+        Args:
+            value: An IRI, with or without surrounding angle brackets.
+
+        Returns:
+            The bare IRI, with surrounding whitespace removed.
+        """
         value = value.strip()
         if value.startswith("<") and value.endswith(">"):
             return value[1:-1]
@@ -55,14 +106,18 @@ class TPFAdapter:
     # ------------------------------------------
     @staticmethod
     def _build_indices(repo):
-        """
-        Given a list of (s, p, o) run_query_strict term dicts, return:
-          - type_of:  { entity_iri -> set of class IRIs }
-                      (only rdf:type objects that are URI terms are
-                      admitted as classes; blank-node/literal "types"
-                      are dropped)
-          - data:     [ (s, p, o) ] non-rdf:type triples only, as plain
-                      string values
+        """Sort harvested triples into type assertions and everything else.
+
+        Args:
+            repo: Triples as returned by `run_query_strict`, each a
+                tuple of three SPARQL-JSON term dicts.
+
+        Returns:
+            A (type_of, data) pair. `type_of` maps an entity IRI to the
+            set of classes it is typed with, admitting only classes that
+            are IRIs, so a blank-node or literal "class" is dropped
+            rather than indexed. `data` holds the remaining triples as
+            plain strings, with control metadata removed.
         """
         type_of = {}     # entity → {class, ...}
         data = []
@@ -85,10 +140,18 @@ class TPFAdapter:
 
     # ------------------------------------------
     def exploratory_types(self):
+        """List the classes the repository holds.
+
+        Returns:
+            Class IRIs as plain strings, in no particular order. Blank
+            nodes, literals, malformed IRIs and the server's own
+            metadata classes are all left out.
+        """
         query = "SELECT DISTINCT ?type WHERE { ?s a ?type . }"
         repo = run_query_strict(query, [self.endpoint])
 
         def is_valid_class(term):
+            """Return True for a term usable as a class IRI in the index."""
             if not _is_uri_term(term):
                 return False
             iri = _term_value(term).strip()
@@ -107,10 +170,16 @@ class TPFAdapter:
 
     # ------------------------------------------
     def outgoing_patterns(self, type_):
-        """
-        For every triple   ?s  ?predicate  ?object
-        where ?s is of type <type_>, also look up ?object's type
-        so the Engine can write sh:class.
+        """List the predicates leading out of instances of `type_`.
+
+        Args:
+            type_: IRI of the class to explore. Angle brackets, if
+                present, are stripped.
+
+        Returns:
+            One solution dict per distinct (predicate, object class)
+            pair. "object_type" is an empty dict wherever the object
+            carries no explicit class.
         """
         type_ = self.normalize_iri(type_)
         query = f"""
@@ -163,9 +232,17 @@ class TPFAdapter:
 
     # ------------------------------------------
     def incoming_patterns(self, type_):
-        """
-        For every triple   ?subject  ?predicate  ?o
-        where ?o is of type <type_>, also look up ?subject's type.
+        """List the predicates leading into instances of `type_`.
+
+        Args:
+            type_: IRI of the class to explore. Angle brackets, if
+                present, are stripped.
+
+        Returns:
+            One solution dict per distinct (subject class, predicate)
+            pair. A subject carrying no explicit class contributes
+            nothing, since an incoming relationship needs a named class
+            at its far end to be matchable later.
         """
         type_ = self.normalize_iri(type_)
         query = f"""

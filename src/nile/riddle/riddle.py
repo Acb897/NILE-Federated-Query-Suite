@@ -1,33 +1,56 @@
-"""
-query_matching_class.py
+"""Matching queries against repository profiles.
 
-Query -> SHACL matching (partial responsiveness by triple-pattern overlap)
+RIDDLE decides which repositories are worth asking for a given SPARQL
+query, using only the SHACL profiles produced offline. No repository is
+contacted.
 
-Matching rules (any one hit = endpoint is responsive):
-  1. Exact:            query (A, P, B)   in SHACL exact (A, P, B)
-  2. SHACL wildcard:   query (A, P, *)   where SHACL has (A, P, ANY)
-  3. Query B wildcard: query (A, P, ANY) where SHACL has exact (A, P, B)
-  4. Subject ANY:      query (ANY, P, *) where P exists anywhere in SHACL
+Both sides are reduced to the same thing: a set of (A, P, B) triples,
+where A is the class of the subject, P the predicate, and B the class of
+the object. A class that cannot be established becomes the wildcard ANY.
+A repository is kept as soon as one of its triples is compatible with
+one of the query's, under any of four rules:
 
-The query-side abstraction and the four matching rules are unchanged.
-The endpoint-side abstraction A(E) is now produced by a loader that
-tolerates shapes graphs emitted by extractors other than SPHINX
-(sheXer, QSE, SHACLGen, ...). The differences it accommodates are:
+    1. Exact             query (A, P, B)   against profile (A, P, B)
+    2. Profile gap       query (A, P, *)   against profile (A, P, ANY)
+    3. Query gap         query (A, P, ANY) against profile (A, P, B)
+    4. Unknown subject   query (ANY, P, *) where P appears anywhere in
+                         the profile
 
-  - sh:path may be a path expression rather than a plain IRI. An
-    inverse path is folded into an (A, P, B) pattern with its ends
-    exchanged, which is how sheXer records what SPHINX records as
-    P-(c). Composite paths contribute their predicates to rule 4 only.
-  - the subject class may be declared by an implicit class target
-    (the shape node is itself an rdfs:Class) rather than by
-    sh:targetClass, or may be absent altogether.
-  - the value class may sit behind sh:node, sh:qualifiedValueShape or
-    an sh:and / sh:or / sh:xone operand rather than on a direct
-    sh:class.
-  - profiles may arrive in a serialisation other than Turtle.
+Rules 2 and 3 are what make the result useful rather than merely
+correct. A missing class means "not known", not "does not occur", so a
+repository is kept whenever it might contribute. The aim is to find
+repositories that could help, not to prove that any one of them could
+answer the query by itself.
 
-Abstracted profiles are cached on (mtime, size), since A(E) was
-otherwise recomputed for every incoming query.
+Despite the vocabulary, this is not SHACL validation. Validation asks
+whether a data graph satisfies a set of constraints; here two structural
+descriptions are compared against each other, and a standard SHACL
+engine would answer a different question.
+
+Usage::
+
+    from nile.riddle.riddle import shacl_validator
+
+    responsive = shacl_validator(query, "./shacl_output",
+                                 identify_by="source")
+
+Profiles need not come from SPHINX. Shapes written by other extractors
+(sheXer, QSE, SHACLGen and so on) are read too, which means
+accommodating several things SPHINX never emits:
+
+  - sh:path holding a path expression rather than a plain IRI. An
+    inverse path becomes an (A, P, B) triple with its ends swapped,
+    which is how sheXer records what SPHINX records as an incoming
+    relationship. Composite paths contribute to rule 4 only.
+  - a subject class declared by an implicit class target -- the shape
+    node being an rdfs:Class itself -- rather than by sh:targetClass,
+    or missing altogether.
+  - a value class sitting behind sh:node, sh:qualifiedValueShape or an
+    sh:and / sh:or / sh:xone operand rather than on a direct sh:class.
+  - a serialisation other than Turtle.
+
+Parsed profiles are cached on the file's modification time and size, so
+each is abstracted once rather than once per incoming query.
 """
 
 import os
@@ -66,16 +89,25 @@ _LOGICAL = (SH["and"], SH["or"], SH.xone)
 # ---------------------------------------------------------------------------
 
 def collect_triple_patterns(node, acc=None, visited=None):
-    """
-    Recursively descend a rdflib SPARQL algebra tree and collect all
-    (subject, predicate, object) triples from BGP nodes.
+    """Collect every triple pattern in a parsed query.
 
-    Handles:
-      - BGP nodes         -> extract .triples directly
-      - list / tuple      -> iterate elements
-      - other CompValues  -> recurse into .values()
-      - RDF terms / scalars -> ignored (leaves)
-    A visited set (by id) prevents infinite loops on cycles.
+    Walks an rdflib SPARQL algebra tree and gathers the triples out of
+    every basic graph pattern it contains, descending through everything
+    on the way -- OPTIONAL, UNION, FILTER and the rest alike.
+
+    Args:
+        node: An algebra node, normally the root of a translated query.
+        acc: Accumulator for the recursion. Leave unset.
+        visited: Cycle guard for the recursion. Leave unset.
+
+    Returns:
+        A list of (subject, predicate, object) tuples of rdflib terms.
+
+    Note:
+        Because the walk descends everywhere, a pattern the query treats
+        as optional is collected on the same footing as one it requires.
+        For source selection that is intended: a repository holding only
+        the optional part is still worth asking.
     """
     if acc is None:
         acc = []
@@ -123,22 +155,46 @@ def collect_triple_patterns(node, acc=None, visited=None):
 # ---------------------------------------------------------------------------
 
 def _is_var(term) -> bool:
+    """Return True if `term` is a SPARQL variable."""
     return isinstance(term, Variable)
 
 
 def _is_uri(term) -> bool:
+    """Return True if `term` is an IRI."""
     return isinstance(term, URIRef)
 
 
 def extract_APB_from_query(query_string: str, debug: bool = True) -> List[APBPattern]:
-    """
-    Parse query -> collect triple patterns -> derive (A, P, B).
+    """Reduce a query to its (A, P, B) triples.
 
-    A/B are the concrete rdf:type IRI of the subject/object variable
-    (from ?var rdf:type <IRI> patterns in the same query), or ANY when
-    no type constraint is present.
-    Patterns with a variable predicate are skipped.
-    rdf:type triples are skipped (they supply type info, not data).
+    Variables are typed from the rdf:type patterns in the same query, so
+    `?p rdf:type ex:Plant` makes ex:Plant the class of ?p wherever it
+    appears. Anything that cannot be typed that way becomes ANY.
+    Variable names are then discarded, so two queries with the same
+    shape and different names reduce to the same set.
+
+    Args:
+        query_string: The SPARQL query.
+        debug: Whether to print the intermediate steps to standard
+            output.
+
+    Returns:
+        A list of (A, P, B) triples of strings, where A and B may be
+        ANY.
+
+    Raises:
+        Exception: Whatever rdflib raises if the query cannot be parsed.
+
+    Note:
+        Patterns with a variable predicate are skipped -- there is
+        nothing there to match a profile against. rdf:type patterns are
+        skipped too, since they supply the typing rather than a
+        relationship of their own.
+
+        A variable asserted to belong to more than one class carries all
+        of them at once, and the triples are taken over every
+        combination. That holds even when the two assertions sit in
+        different branches of a UNION and could never apply together.
     """
     parsed = parseQuery(query_string)
     query_obj = translateQuery(parsed)
@@ -209,23 +265,31 @@ def extract_APB_from_query(query_string: str, debug: bool = True) -> List[APBPat
 # ---------------------------------------------------------------------------
 
 class Profile:
-    """
-    The endpoint-side abstraction A(E), plus what is needed to evaluate
-    matching rule 4 and to identify the repository the profile belongs
-    to.
+    """A repository profile, reduced to what matching needs.
 
-      patterns : set of (A, P, B), A/B possibly ANY
-      paths    : every predicate IRI referenced by any sh:path,
-                 including those buried inside path expressions. Rule 4
-                 must be evaluated against this rather than against the
-                 raw sh:path objects of the graph, which are blank-node
-                 identifiers whenever a path expression is used.
-      source   : the endpoint described (dct:source), when declared.
+    Attributes:
+        patterns: The (A, P, B) triples, where A and B may be ANY.
+        paths: Every predicate IRI referenced by any sh:path, including
+            those buried inside path expressions. Rule 4 is evaluated
+            against this rather than against the raw sh:path objects of
+            the graph, which are blank-node identifiers whenever a path
+            expression is used.
+        source: The repository the profile describes, from dct:source,
+            where it declares one.
+        path: The file the profile was read from.
     """
 
     __slots__ = ("patterns", "paths", "source", "path")
 
     def __init__(self, patterns, paths, source=None, path=None):
+        """Store one abstracted profile.
+
+        Args:
+            patterns: Set of (A, P, B) triples.
+            paths: Set of predicate IRIs appearing in any sh:path.
+            source: Repository the profile describes, if declared.
+            path: File the profile was read from.
+        """
         self.patterns: Set[APBPattern] = patterns
         self.paths: Set[str] = paths
         self.source: Optional[str] = source
@@ -233,7 +297,16 @@ class Profile:
 
 
 def _list_items(g: Graph, node) -> List:
-    """Traverse an rdf:List, guarding against cycles."""
+    """Read an rdf:List into a Python list.
+
+    Args:
+        g: The graph holding the list.
+        node: The head of the list.
+
+    Returns:
+        The items, in order. A malformed or cyclic list stops the walk
+        rather than hanging.
+    """
     items, seen = [], set()
     while node is not None and node != RDF.nil and node not in seen:
         seen.add(node)
@@ -245,22 +318,26 @@ def _list_items(g: Graph, node) -> List:
 
 
 def _analyse_path(g: Graph, node, depth: int = 0):
-    """
-    Resolve an sh:path value.
+    """Work out what an sh:path value denotes.
 
-    Returns (simple, predicates) where
+    Args:
+        g: The shapes graph.
+        node: The object of an sh:path statement.
+        depth: Recursion guard. Leave unset.
 
-      simple     : (predicate_iri, inverted) when the path denotes a
-                   single predicate traversed in one direction, else
-                   None.
-      predicates : every predicate IRI the expression references, used
-                   for matching rule 4.
+    Returns:
+        A (simple, predicates) pair. `simple` is a (predicate IRI,
+        inverted) tuple when the path denotes a single predicate
+        travelled in one direction, and None otherwise. `predicates` is
+        every predicate IRI the expression mentions, which is what rule
+        4 needs.
 
-    Cardinality modifiers over a single predicate remain "simple", since
-    the relation A --p--> B does hold of the underlying predicate.
-    Sequence and alternative paths do not: they denote a composite
-    relation whose two ends are not the ends of any single predicate, so
-    they contribute their predicates to rule 4 only.
+    Note:
+        A cardinality modifier over a single predicate still counts as
+        simple, since the relationship does hold of the underlying
+        predicate. Sequence and alternative paths do not: they denote a
+        composite whose two ends are not the ends of any one predicate,
+        so they feed rule 4 alone.
     """
     if depth > 8 or node is None:
         return None, []
@@ -301,17 +378,27 @@ def _analyse_path(g: Graph, node, depth: int = 0):
 
 
 def _is_implicit_class(g: Graph, node) -> bool:
-    """
-    SHACL implicit class target: a node that is both a shape and an
-    rdfs:Class is its own target. SHACLGen's --implicit mode and some
-    ontology-derived profiles rely on this instead of sh:targetClass.
+    """Return True for a node that is its own target class.
+
+    SHACL lets a node that is both a shape and an rdfs:Class target
+    itself instead of naming a target with sh:targetClass. SHACLGen's
+    implicit mode and some ontology-derived profiles rely on this.
     """
     types = set(g.objects(node, RDF.type))
     return RDFS.Class in types and (SH.NodeShape in types or SH.Shape in types)
 
 
 def _shape_class(g: Graph, shape) -> List[str]:
-    """The class(es) a node shape targets, for use as the B position."""
+    """Return the class or classes a node shape targets.
+
+    Args:
+        g: The shapes graph.
+        shape: The node shape.
+
+    Returns:
+        Their IRIs as strings, from sh:targetClass or from an implicit
+        class target. Empty if the shape names neither.
+    """
     out = [str(o) for _, _, o in g.triples((shape, SH.targetClass, None))
            if isinstance(o, URIRef)]
     if not out and isinstance(shape, URIRef) and _is_implicit_class(g, shape):
@@ -320,13 +407,25 @@ def _shape_class(g: Graph, shape) -> List[str]:
 
 
 def _value_classes(g: Graph, prop_shape, depth: int = 0) -> List[str]:
-    """
-    Every class the value of a property shape may take: sh:class
-    directly, the target class of an sh:node reference, the operands of
-    sh:and / sh:or / sh:xone, and sh:qualifiedValueShape. sh:datatype
-    and sh:nodeKind sh:Literal contribute nothing, which correctly
-    yields the ANY wildcard and preserves the reading of a missing class
-    as absence of information rather than absence of the relation.
+    """List every class the value of a property shape may take.
+
+    Looks at sh:class directly, the target class behind an sh:node
+    reference, the operands of sh:and / sh:or / sh:xone, and
+    sh:qualifiedValueShape.
+
+    Args:
+        g: The shapes graph.
+        prop_shape: The property shape.
+        depth: Recursion guard. Leave unset.
+
+    Returns:
+        Class IRIs as strings. Empty when none can be established.
+
+    Note:
+        sh:datatype and sh:nodeKind sh:Literal contribute nothing, which
+        is what is wanted here: an empty result becomes the ANY
+        wildcard, so a missing class keeps its reading of "not known"
+        rather than "no such relationship".
     """
     if depth > 6:
         return []
@@ -352,10 +451,20 @@ def _value_classes(g: Graph, prop_shape, depth: int = 0) -> List[str]:
 
 
 def _property_shapes(g: Graph, shape, depth: int = 0, seen=None) -> List:
-    """
-    Property shapes attached to a node shape, following sh:property
-    directly and descending through sh:and / sh:or / sh:xone, which some
-    emitters use to group alternative constraint sets.
+    """Return the property shapes attached to a node shape.
+
+    Follows sh:property directly, and descends through sh:and / sh:or /
+    sh:xone, which some extractors use to group alternative sets of
+    constraints.
+
+    Args:
+        g: The shapes graph.
+        shape: The node shape.
+        depth: Recursion guard. Leave unset.
+        seen: Cycle guard. Leave unset.
+
+    Returns:
+        The property shape nodes.
     """
     if seen is None:
         seen = set()
@@ -374,15 +483,21 @@ def _property_shapes(g: Graph, shape, depth: int = 0, seen=None) -> List:
 
 
 def _shape_targets(g: Graph, shape, prop_shapes: Sequence) -> List[str]:
-    """
-    The subject class(es) a node shape describes, i.e. the A position.
+    """Return the class or classes a node shape describes: the A position.
 
-    Falls back through: sh:targetClass, implicit class target, and a
-    property shape asserting `sh:path rdf:type ; sh:hasValue <C>`, which
-    is how some emitters encode typing rather than as a target. A shape
-    with no recoverable target still yields patterns, with A = ANY, so
-    that its predicates remain visible to matching rule 4 rather than
-    being discarded.
+    Tries sh:targetClass, then an implicit class target, then a property
+    shape asserting `sh:path rdf:type ; sh:hasValue <C>`, which is how
+    some extractors encode typing rather than as a target.
+
+    Args:
+        g: The shapes graph.
+        shape: The node shape.
+        prop_shapes: Its property shapes, from `_property_shapes`.
+
+    Returns:
+        Class IRIs as strings, or [ANY] when none can be recovered. A
+        shape with no recoverable target still yields triples that way,
+        so its predicates stay visible to rule 4 instead of being lost.
     """
     targets = _shape_class(g, shape)
     if targets:
@@ -399,8 +514,23 @@ def _shape_targets(g: Graph, shape, prop_shapes: Sequence) -> List[str]:
 
 
 def extract_profile(shapes_graph: Graph, path: Optional[str] = None) -> Profile:
-    """
-    Abstract a shapes graph, from any emitter, into A(E).
+    """Reduce a shapes graph to a Profile.
+
+    Works on shapes from any extractor, not only SPHINX; the module
+    docstring lists what that involves accommodating.
+
+    Args:
+        shapes_graph: The parsed shapes graph.
+        path: The file it came from, recorded on the result.
+
+    Returns:
+        The Profile.
+
+    Note:
+        sh:targetSubjectsOf and sh:targetObjectsOf name a real predicate
+        of the data even though they say nothing about the class at
+        either end, so they are registered as (ANY, P, ANY) to keep rule
+        4 correct.
     """
     patterns: Set[APBPattern] = set()
     paths: Set[str] = set()
@@ -475,11 +605,19 @@ def extract_profile(shapes_graph: Graph, path: Optional[str] = None) -> Profile:
 
 
 def extract_APB_from_shacl(shapes_graph: Graph) -> List[APBPattern]:
-    """
-    Signature-compatible with the original function, retained for
-    callers that only need the pattern set. Note that a caller relying
-    on this alone cannot evaluate rule 4 correctly, since the predicates
-    of composite paths are carried on Profile.paths.
+    """Reduce a shapes graph to its (A, P, B) triples alone.
+
+    Args:
+        shapes_graph: The parsed shapes graph.
+
+    Returns:
+        The triples, as a list.
+
+    Note:
+        Kept for callers that want nothing but the triples. Rule 4
+        cannot be evaluated from this alone, because the predicates of
+        composite paths are carried on `Profile.paths` and not here. Use
+        `extract_profile` where matching is the aim.
     """
     return list(extract_profile(shapes_graph).patterns)
 
@@ -493,14 +631,24 @@ _profile_cache: Dict[str, Tuple[float, int, Profile]] = {}
 
 
 def load_profile(file_path: str, use_cache: bool = True) -> Optional[Profile]:
-    """
-    Parse and abstract one profile file. The serialisation is guessed
-    from the extension rather than assumed to be Turtle, since the
-    extractors NILE can consume profiles from do not all default to it.
+    """Read one profile file and reduce it to a Profile.
 
-    Cached on (mtime, size): A(E) was otherwise recomputed for every
-    incoming query, which is tolerable for a SPHINX profile and not for
-    a profile extracted from a large graph by a third-party tool.
+    The serialisation is guessed from the extension rather than assumed
+    to be Turtle, since the extractors NILE can read profiles from do
+    not all default to it.
+
+    Results are cached on the file's modification time and size, so a
+    profile is abstracted once rather than once per query -- tolerable
+    for a SPHINX profile, less so for one extracted from a large graph
+    by another tool.
+
+    Args:
+        file_path: Path to the profile file.
+        use_cache: Whether to reuse a cached abstraction.
+
+    Returns:
+        The Profile, or None if the file could not be read or parsed.
+        Failures are logged as warnings rather than raised.
     """
     try:
         stat = os.stat(file_path)
@@ -528,10 +676,16 @@ def load_profile(file_path: str, use_cache: bool = True) -> Optional[Profile]:
 
 
 def discover_profiles(shacl_dir: str) -> List[str]:
-    """
-    Every profile file in a directory, in a stable order. Replaces the
-    previous glob for "*.ttl", which silently ignored profiles emitted
-    in any other serialisation.
+    """List the profile files in a directory.
+
+    Args:
+        shacl_dir: Directory to look in. Not searched recursively.
+
+    Returns:
+        Paths, sorted by filename. Only files whose extension is a
+        recognised RDF serialisation are included, so a profile written
+        with an unusual extension is passed over. Empty if the directory
+        cannot be listed.
     """
     try:
         names = sorted(os.listdir(shacl_dir))
@@ -544,7 +698,12 @@ def discover_profiles(shacl_dir: str) -> List[str]:
 
 
 def clear_profile_cache() -> None:
-    """Drop every cached abstraction (for tests, or after re-indexing)."""
+    """Drop every cached abstraction.
+
+    Worth calling after re-indexing, or between tests. Profiles are
+    otherwise cached until their file's modification time or size
+    changes.
+    """
     _profile_cache.clear()
 
 
@@ -555,30 +714,37 @@ def clear_profile_cache() -> None:
 def shacl_validator(query_string: str, shacl_dir: str,
                     debug: bool = True,
                     identify_by: str = "filename") -> List[str]:
-    """
-    Determine which SHACL endpoint profiles are responsive to the given
-    query.
+    """Find the repositories responsive to a query.
 
-    Matching rules (any hit = endpoint marked responsive):
-      1. Exact:            query (A, P, B)   in SHACL exact (A, P, B)
-      2. SHACL wildcard:   query (A, P, *)   where SHACL has (A, P, ANY)
-      3. Query B wildcard: query (A, P, ANY) where SHACL has exact (A, P, B)
-      4. Subject ANY:      query (ANY, P, *) where P exists in any SHACL path
+    The query is reduced to its (A, P, B) triples, every profile in
+    `shacl_dir` is reduced the same way, and the two are compared under
+    the four rules described in the module docstring. One compatible
+    pair is enough.
 
-    NOTE: earlier versions of this function required the query to contain
-    at least one rdf:type triple pattern before any matching was
-    attempted, on the assumption that a query with no explicit typing
-    could not be usefully abstracted. That gate has been removed: a query
-    with no rdf:type patterns at all still abstracts to one or more
-    (ANY, P, ANY) APB patterns (see extract_APB_from_query), which rule 4
-    is specifically designed to match against. Rejecting such queries
-    outright discarded exactly the case rule 4 exists to handle.
+    Args:
+        query_string: The SPARQL query.
+        shacl_dir: Directory of profile files, as written by
+            `nile.sphinx.sphinx.Engine.shacl_generator`.
+        debug: Whether to print the reasoning for each profile to
+            standard output.
+        identify_by: How to name each responsive repository.
+            "filename" gives the profile file's stem; "source" gives the
+            repository the profile declares in dct:source, falling back
+            to the stem where it declares none -- as every profile not
+            written by SPHINX will.
 
-    `identify_by` selects what is returned for each responsive profile:
-    "filename" (the profile file's stem, the historical behaviour) or
-    "source" (the dct:source endpoint the profile declares, falling back
-    to the stem when it declares none, which is the case for every
-    profile not generated by SPHINX).
+    Returns:
+        One entry per responsive profile, in filename order. Empty if
+        the query holds nothing matchable, or if nothing matched.
+
+    Note:
+        A profile that cannot be read is logged and skipped, so one bad
+        file does not cost the rest of the directory.
+
+        A query with no rdf:type patterns at all is still matched: it
+        reduces to (ANY, P, ANY) triples, which is precisely what rule 4
+        exists to handle. Rejecting such queries would discard the case
+        the rule was written for.
     """
     if debug:
         print("[shacl_validator] Extracting APB from query...")

@@ -1,3 +1,34 @@
+"""The SPHINX indexing engine.
+
+Turns a repository into a description of the shape of its data. For
+every class the repository holds, the engine records which predicates
+lead out of its instances and which lead in, together with the class at
+the far end of each. The result is written out as SHACL, one file per
+repository.
+
+What comes out describes how information is organised, not which
+information is stored: two repositories following the same data model
+produce near-identical files even with no data in common.
+
+Usage::
+
+    from nile.sphinx.sphinx import Engine
+
+    engine = Engine()
+    index = engine.extract_patterns(["http://example.org/sparql"])
+    engine.shacl_generator(index, "./shacl_output")
+
+`extract_patterns` also takes a mode of "dump" or "tpf", which decides
+how the sources are reached; see `nile.sphinx.adapters`.
+
+Classes are explored in parallel. Set the SPHINX_MAX_WORKERS environment
+variable, or pass `max_workers` to `Engine`, to change how many at a
+time. How long indexing takes depends mostly on how many distinct
+classes a repository holds, not on how many triples.
+
+Progress is reported on standard output throughout.
+"""
+
 import hashlib
 import os
 import re
@@ -19,8 +50,36 @@ SPHINX_MAX_WORKERS = int(os.environ.get("SPHINX_MAX_WORKERS", "6"))
 # SPO Pattern Container
 # ==============================
 class SPO:
+    """One structural relationship, as recorded during exploration.
+
+    A plain container: the class at the subject end, the predicate, the
+    class at the object end, and the graph it was seen in.
+
+    The object class may be an empty string, meaning it could not be
+    determined -- the object was a literal, or was never typed. The
+    relationship is still recorded, since the predicate is real even
+    when what it points at is unclassified.
+
+    The graph is only used to tell two observations of the same
+    relationship apart while indexing. It does not reach the SHACL
+    output.
+
+    Attributes:
+        SPO_Subject: IRI of the class at the subject end.
+        SPO_Predicate: IRI of the predicate.
+        SPO_Object: IRI of the class at the object end, or "".
+        SPO_Graph: IRI of the graph it was observed in.
+    """
 
     def __init__(self, params=None):
+        """Build a relationship from a dict of field values.
+
+        Args:
+            params: Any of "SPO_Subject", "SPO_Predicate", "SPO_Object"
+                and "SPO_Graph". Missing keys default to the empty
+                string, except the graph, which defaults to
+                "urn:default-graph".
+        """
         params = params or {}
         self.SPO_Subject = params.get("SPO_Subject", "")
         self.SPO_Predicate = params.get("SPO_Predicate", "")
@@ -32,10 +91,43 @@ class SPO:
 # Engine
 # ==============================
 class Engine:
+    """Explores repositories and writes out their descriptions.
+
+    One engine indexes any number of repositories in sequence: call
+    `extract_patterns` to explore them, then `shacl_generator` to write
+    the result to disk.
+
+    The engine keeps the working state of the exploration on itself and
+    resets it at the start of each repository, so a single instance
+    should not be driven from more than one thread. Within a repository,
+    though, classes are explored concurrently and the shared bookkeeping
+    is locked accordingly.
+
+    Attributes:
+        hashed_patterns: Fingerprints of the relationships already seen
+            for the repository being explored, so none is recorded
+            twice.
+        patterns: Class IRI -> list of `SPO`, for the repository
+            currently being explored.
+        endpoint_graph_mode: Repository -> where its content lives:
+            "default", "named", "mixed" or "none".
+        endpoint_patterns: Repository -> its finished `patterns` dict.
+            This is the index, and what `extract_patterns` returns.
+        max_workers: How many classes are explored at once.
+    """
 
     RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
 
     def __init__(self, max_workers=None):
+        """Create an engine with empty state.
+
+        Args:
+            max_workers: How many classes to explore concurrently.
+                Defaults to the SPHINX_MAX_WORKERS environment
+                variable, or 6. Raising it speeds up repositories with
+                many classes, at the cost of a heavier load on the
+                source.
+        """
         self.hashed_patterns = set()
         self.patterns = {}
         self.endpoint_graph_mode = {}
@@ -59,28 +151,34 @@ class Engine:
     # Detect if endpoint contains named graphs, the default graph, or both
     # --------------------------------------------------
     def detect_named_graphs(self, endpoint_URL):
-        """
-        Determines self.endpoint_graph_mode[endpoint_URL] as one of:
-          "default" -- data found only in the default graph
-          "named"   -- data found only inside named graphs
-          "mixed"   -- data found in both
-          "none"    -- neither ASK succeeded (empty or unreachable
-                       endpoint); treated the same as "default" by
-                       build_query, which is the cheapest/safest query
-                       shape to fall back to.
+        """Work out where a repository keeps its content.
 
-        Two independent ASKs are required: a single
-        `ASK { GRAPH ?g { ?s ?p ?o } }` (the previous approach) only
-        tells you whether *any* named graph exists, and says nothing
-        about whether the default graph is also populated. Treating
-        every endpoint as either purely "named" or purely "default" from
-        one boolean silently drops the default-graph portion of a mixed
-        endpoint (or vice-versa).
+        Some repositories put everything in the default graph, some in
+        named graphs, and some use both. Exploration queries have to be
+        shaped accordingly, so this runs once per repository, before
+        exploration begins, and records the answer in
+        `endpoint_graph_mode`.
+
+        Two separate ASK queries are needed. Asking only whether any
+        named graph exists says nothing about whether the default graph
+        is populated too, and assuming a repository is purely one or the
+        other would silently drop half the content of one that is both.
+
+        Args:
+            endpoint_URL: URL of the SPARQL endpoint to test.
+
+        Note:
+            The recorded mode is "default", "named", "mixed", or "none"
+            when both queries ran but found nothing. If neither query
+            could be run at all -- an unreachable endpoint, say --
+            "default" is recorded, that being the cheapest query shape
+            to fall back to.
         """
 
         print(f"\n[Engine] Detecting graph mode for {endpoint_URL}...")
 
         def ask(query):
+            """Run one ASK query and return its boolean answer."""
             sparql = SPARQLWrapper(endpoint_URL)
             sparql.setMethod("POST")
             sparql.setQuery(query)
@@ -118,6 +216,23 @@ class Engine:
     # Deduplication
     # --------------------------------------------------
     def in_database(self, s, p, o, g):
+        """Check whether a relationship is already known, and claim it.
+
+        The check and the claim happen together under a lock, so two
+        threads exploring different classes cannot both conclude that
+        the same relationship is new.
+
+        Args:
+            s: IRI of the class at the subject end.
+            p: IRI of the predicate.
+            o: IRI of the class at the object end, or "".
+            g: IRI of the graph it was observed in.
+
+        Returns:
+            True if the relationship was already known, in which case
+            the caller should not record it again. False if it is new --
+            and it has now been marked as seen.
+        """
 
         digest = hashlib.sha256(f"{s}|{p}|{o}|{g}".encode()).hexdigest()
 
@@ -136,16 +251,29 @@ class Engine:
     # Add pattern
     # --------------------------------------------------
     def add_triple_pattern(self, type_, s, p, o, g):
-        """
-        Record one structural pattern for class `type_`.
+        """Record one structural relationship for a class.
 
-        Callers are responsible for resolving `s` and `o` to a class IRI
-        *only* when the underlying RDF term is a URI/IRI (never a blank
-        node or literal) -- see adapters.*. This method no longer makes
-        that decision itself via a string prefix, since a class IRI is
-        not required to use the http(s) scheme (e.g. urn:, doi:, ark:).
-        A blank-node or otherwise unresolved class is expected to arrive
-        here as an empty string and is rejected below on that basis.
+        Args:
+            type_: IRI of the class this relationship is filed under.
+            s: IRI of the class at the subject end.
+            p: IRI of the predicate.
+            o: IRI of the class at the object end, or "" if unknown.
+            g: IRI of the graph it was observed in. Anything empty
+                becomes "urn:default-graph".
+
+        Note:
+            Callers resolve `s` and `o` to a class IRI only when the
+            underlying term really is an IRI, never a blank node or a
+            literal, and pass "" otherwise. That decision is not made
+            here by testing the string for an "http" prefix, because a
+            class IRI need not use the http(s) scheme -- urn:, doi: and
+            ark: are all legitimate.
+
+            Relationships with no predicate or no subject class are
+            dropped, as are rdf:type relationships. SHACL has no
+            structural way to say "this exact value", and RIDDLE strips
+            rdf:type out of queries in any case, so such a relationship
+            could never be matched against.
         """
 
         s = str(s).strip()
@@ -192,34 +320,31 @@ class Engine:
     # Graph scoping helper
     # --------------------------------------------------
     def _graph_scope(self, graph_mode, content, graph_var, bind_graph_var=False):
-        """
-        Wrap `content` (a graph-pattern fragment with no GRAPH clause of
-        its own) so that it matches regardless of which graph it is
-        actually stored in, according to `graph_mode`:
+        """Scope a query fragment so it matches whichever graph it is in.
 
-          "default"        -> content must match in the default graph
-          "named"          -> content must match inside GRAPH ?<graph_var>
-          "mixed" / "none" -> content may match in EITHER the default
-                               graph OR any named graph -- evaluated
-                               independently for this fragment only.
+        Args:
+            graph_mode: Where the repository keeps its content, as
+                established by `detect_named_graphs`.
+            content: A graph-pattern fragment with no GRAPH clause of
+                its own.
+            graph_var: Name of the graph variable to use, without
+                the "?".
+            bind_graph_var: Whether to bind `graph_var` to
+                "urn:default-graph" in the default-graph branch. Set
+                this only for the fragment whose graph variable is
+                selected; for the others it is a throwaway.
 
-        Each call site supplies its own `graph_var`. This is the key
-        difference from the previous implementation, which wrapped an
-        entire BGP in a single `GRAPH ?g { ... }` block: every triple
-        pattern was then forced to bind the SAME named graph, so a
-        subject typed in one named graph but linked to another resource
-        by a predicate asserted in a *different* named graph was
-        invisible (the join on ?g could never succeed). Giving the
-        subject-type clause, the data-triple clause, and the object-type
-        clause each their own graph variable lets them resolve in
-        different graphs independently, so such cross-graph structural
-        relationships are still discovered.
+        Returns:
+            The fragment scoped to the default graph, to any named
+            graph, or to either, depending on `graph_mode`.
 
-        `bind_graph_var`: only the data-triple clause's graph variable
-        (?g) is actually SELECTed and used for deduplication in
-        in_database(); the type-assertion clauses' graph variables are
-        throwaway and left unbound in the default-graph branch. Set
-        True only for the clause whose graph_var is projected.
+        Note:
+            Each fragment of a query gets its own graph variable rather
+            than the whole query being wrapped in a single GRAPH block.
+            Sharing one variable would force every part of the query to
+            match in the same named graph, hiding any relationship whose
+            two ends were asserted in different named graphs of the same
+            repository.
         """
         default_branch = content
         if bind_graph_var:
@@ -239,6 +364,27 @@ class Engine:
     # Query Builder
     # --------------------------------------------------
     def build_query(self, endpoint_URL, mode, type_=None):
+        """Build the SPARQL query for one exploration step.
+
+        Args:
+            endpoint_URL: The repository being explored, used to look up
+                where it keeps its content.
+            mode: Which step to build. "exploratory" lists the classes,
+                "fixed_subject" lists what leads out of a class, and
+                "fixed_object" lists what leads into it.
+            type_: IRI of the class being explored. Needed by
+                "fixed_subject" and "fixed_object", unused otherwise.
+
+        Returns:
+            The query as a string, or None if `mode` is not one of the
+            three.
+
+        Note:
+            Every query selects DISTINCT, so a row comes back per
+            distinct combination rather than per matching triple. What
+            is transferred therefore follows how varied a repository is,
+            not how large.
+        """
 
         graph_mode = self.endpoint_graph_mode.get(endpoint_URL, "mixed")
 
@@ -311,6 +457,20 @@ class Engine:
     # Execute query
     # --------------------------------------------------
     def query_endpoint(self, endpoint_URL, mode, type_=None):
+        """Run one exploration query and return its solutions.
+
+        Args:
+            endpoint_URL: URL of the SPARQL endpoint to query.
+            mode: Which exploration step to run; see `build_query`.
+            type_: IRI of the class being explored, where the step needs
+                one.
+
+        Returns:
+            Solution dicts in SPARQL-JSON form, or an empty list if the
+            query failed. Failures are reported and swallowed rather
+            than raised, so that one unresponsive repository does not
+            abandon the whole run.
+        """
 
         print(f" [Engine] Executing {mode} query for {type_ if type_ else 'N/A'}...")
 
@@ -340,6 +500,32 @@ class Engine:
     # Extract patterns
     # --------------------------------------------------
     def extract_patterns(self, sources, mode="sparql"):
+        """Explore repositories and build their structural descriptions.
+
+        Repositories are processed one after another. For each, the
+        engine establishes where its content lives, lists its classes,
+        then explores those classes concurrently, recording what leads
+        into and out of every one.
+
+        Args:
+            sources: The repositories to index -- SPARQL endpoint URLs
+                for "sparql" mode, RDF file paths for "dump" mode, or
+                fragments server URLs for "tpf" mode.
+            mode: How to reach them: "sparql" (the default), "dump" or
+                "tpf". One call uses one mode for all its sources.
+
+        Returns:
+            A dict mapping each source to its own dict of class IRI ->
+            list of `SPO`. Hand it straight to `shacl_generator`.
+
+        Note:
+            Only "sparql" mode looks for named graphs; dump and TPF
+            sources report everything as being in the default graph.
+
+            A source that cannot be reached contributes an empty entry
+            rather than raising, so one bad repository does not cost the
+            rest of the run.
+        """
 
         self.endpoint_patterns = {}
         print(f"\n[Engine] Starting pattern extraction")
@@ -393,21 +579,19 @@ class Engine:
             from concurrent.futures import ThreadPoolExecutor
 
             def _is_uri_binding(binding):
-                """
-                True only if `binding` is a SPARQL-JSON binding dict for a
-                URI/IRI term (binding["type"] == "uri"). Blank nodes
-                ("bnode") and literals ("literal"/"typed-literal") are
-                rejected here so that a class value is never accepted on
-                the basis of its string prefix (see add_triple_pattern).
-                Adapters that do not speak SPARQL-JSON natively (dump,
-                TPF) are expected to populate this same "type" key
-                themselves -- see adapters/dump_adapter.py.
+                """Return True only for a SPARQL-JSON binding denoting an IRI.
+
+                Blank nodes and literals are rejected here, so a class is
+                never accepted on the strength of what its string looks
+                like. Adapters that do not speak SPARQL-JSON natively are
+                expected to set the "type" key themselves.
                 """
                 return bool(binding) and binding.get("type") == "uri"
 
             def process_type(type_):
 
                 # outgoing
+                """Explore one class and record what it links to."""
                 for sol in adapter.outgoing_patterns(type_):
 
                     g = sol.get("g", {}).get("value", "urn:default-graph")
@@ -448,6 +632,40 @@ class Engine:
     # SHACL Generator
     # --------------------------------------------------
     def shacl_generator(self, patterns_hash, output_dir):
+        """Write the structural descriptions out as SHACL files.
+
+        Every class becomes a NodeShape targeting it, carrying one
+        property shape per predicate observed. Where the class at the
+        far end of a predicate is known it is recorded as sh:class;
+        where it is not, the property shape carries the path alone,
+        which RIDDLE reads as "unknown" rather than "no such
+        relationship".
+
+        The repository each file describes is recorded as dct:source,
+        which is how RIDDLE can report the repository itself rather than
+        a filename.
+
+        No cardinality, datatype or other instance-level constraints are
+        emitted. These files describe shape; although SHACL is a
+        validation language, nothing here is meant to validate anything.
+
+        Args:
+            patterns_hash: The index returned by `extract_patterns`.
+            output_dir: Directory to write into. Created if missing.
+
+        Returns:
+            True. Failure is not reported through the return value.
+
+        Note:
+            Filenames come from each source's host and path. If that
+            name is taken already -- by a different source, or by a file
+            left behind by an earlier run -- a short hash of the URL is
+            appended instead. Re-indexing into a directory that already
+            holds output therefore adds files rather than replacing
+            them, and since RIDDLE reads every file in the directory it
+            is given, clearing it first avoids matching against a stale
+            copy.
+        """
 
         print(f"\n[Engine] Generating SHACL files in {output_dir}...")
 
