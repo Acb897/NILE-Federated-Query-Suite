@@ -1,7 +1,7 @@
 # ------------------------------------------------------
 # Import the engine
 # ------------------------------------------------------
-from nile.sphinx.SPHINX import Engine
+from nile.sphinx.sphinx import Engine
 
 
 # ------------------------------------------------------
@@ -42,7 +42,7 @@ rdf_index = engine.extract_patterns(endpoints)
 # ------------------------------------------------------
 print("Generating SHACL files…")
 
-engine.shacl_generator(rdf_index, "shacl_output")
+engine.shacl_generator(rdf_index, "./shacl_output")
 
 
 print("Done! SHACL files written to ./shacl_output/")
