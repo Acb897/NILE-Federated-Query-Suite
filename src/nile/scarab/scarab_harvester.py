@@ -228,10 +228,10 @@ def _ensure_flusher_running():
 # SCARAB SOFTWARE IDENTITY (used in nanopub provenance)
 # -------------------------------------------------------------------------
 
-SCARAB_CODEBASE_URI = URIRef("https://github.com/myorg/scarab")
+SCARAB_CODEBASE_URI = URIRef("https://github.com/Acb897/NILE-Federated-Query-Suite/tree/main/src/nile/scarab")
 SCARAB_VERSION      = "1.0.0"
 SCARAB_DOWNLOAD_URI = URIRef(
-    f"https://github.com/myorg/scarab/releases/tag/v{SCARAB_VERSION}"
+    f"https://github.com/Acb897/NILE-Federated-Query-Suite/tree/main/src/nile/scarab/releases/tag/v{SCARAB_VERSION}"
 )
 
 # -------------------------------------------------------------------------
@@ -2390,12 +2390,13 @@ def harvest_endpoint_optimized(source, bgp, nanopub_base):
         store and the provenance wrapper written around them.
 
     Note:
-        Setting the module-level INDEXING_MODE to True turns on a strict
-        mode, in which a pattern sharing variables with earlier ones but
-        for which no binding could be found is skipped rather than
-        harvested in full. It is meant for exploratory indexing, where
-        the cost of an unconstrained fragment is not worth paying. Off
-        by default, and nothing in the suite turns it on.
+        The module-level INDEXING_MODE turns on a strict mode, in which
+        a pattern sharing variables with earlier ones but for which no
+        binding could be found is skipped rather than harvested in full.
+        It is meant for exploratory indexing, where the cost of an
+        unconstrained fragment is not worth paying. It is off for
+        ordinary federated querying, and `run_query_strict` enables it
+        around its own harvest.
     """
 
     source = make_datasource(source)
@@ -2662,8 +2663,9 @@ def execute_sparql_query(query, include_types=False, endpoint=None):
         return None
 
 
-def run_query_strict(query, endpoints, base_named_graph="urn:tpf:temp"):
-    """Harvest a query and hand back the triples, unevaluated.
+def run_query_strict(query, endpoints, base_named_graph="urn:tpf:temp",
+                     strict=True):
+    """Harvest a query in strict mode and hand back the triples.
 
     Runs a harvest under a fresh run identifier and reads back
     everything it gathered. Used by SPHINX's TPF adapter, which wants
@@ -2673,6 +2675,10 @@ def run_query_strict(query, endpoints, base_named_graph="urn:tpf:temp"):
         query: The SPARQL query.
         endpoints: The sources; see `make_datasource`.
         base_named_graph: Prefix for the run identifier.
+        strict: Whether to enable INDEXING_MODE for the duration of the
+            harvest, so that a pattern sharing variables with those
+            already harvested, but for which no binding could be found,
+            is skipped rather than retrieved in full.
 
     Returns:
         A list of (subject, predicate, object) triples, each term a
@@ -2680,15 +2686,26 @@ def run_query_strict(query, endpoints, base_named_graph="urn:tpf:temp"):
         source was given, or if nothing was harvested.
 
     Note:
+        Strict mode is what makes this usable for indexing. SPHINX's
+        exploration queries pair a bounded pattern with an unbounded
+        `?subject ?predicate ?object`, so a class that turns out to have
+        no instances yields no bindings for the second pattern, and
+        without strict mode the whole repository would be retrieved to
+        describe a class it does not hold.
+
+        INDEXING_MODE is module-level state, set and restored around the
+        harvest. The previous value is put back even if the harvest
+        raises, but as the module supports one run per process anyway,
+        do not rely on two harvests with different values of `strict`
+        overlapping.
+
         The run's assertion graphs are recomputed here rather than
         searched for, which works because `mint_nanopub_uri` is
         deterministic in the run and the source's position. It is also
         exact: it cannot pick up an assertion graph belonging to another
         run, as a substring test over a shared prefix could.
-
-        Despite the name, this does not enable INDEXING_MODE. A caller
-        wanting that strict skipping behaviour has to set it itself.
     """
+    global INDEXING_MODE
     run_id = str(_uuid_mod.uuid4())
     graph_base = f"{base_named_graph}/{run_id}"
 
@@ -2705,7 +2722,16 @@ def run_query_strict(query, endpoints, base_named_graph="urn:tpf:temp"):
         print("[run_query_strict] No sources supplied")
         return []
 
-    FindBGPPriority(query, endpoints, base_named_graph=graph_base)
+    # Strict mode is enabled for the duration of the harvest only, and
+    # the previous value restored afterwards even on failure, so that a
+    # raising harvest cannot leave the whole process skipping patterns.
+    previous_mode = INDEXING_MODE
+    INDEXING_MODE = strict
+    print(f"[run_query_strict] Strict mode: {strict}")
+    try:
+        FindBGPPriority(query, endpoints, base_named_graph=graph_base)
+    finally:
+        INDEXING_MODE = previous_mode
 
     # Enumerate the assertion graphs of this run explicitly.
     #
