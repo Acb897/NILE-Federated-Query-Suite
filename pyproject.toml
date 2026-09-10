@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "nile-query-suite"
+version = "0.1.0"
+description = "The NILE Query Suite for federated semantic data environments"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+
+authors = [
+    { name = "Alberto Cámara" }
+]
+
+dependencies = [
+    "beautifulsoup4>=4.13.4",
+    "requests>=2.32.3",
+    "rdflib>=7.1.4",
+    "SPARQLWrapper>=2.0.0"
+]
+
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0"
+]
+
+
+[project.urls]
+Homepage = "https://github.com/Acb897/NILE"
+Repository = "https://github.com/Acb897/NILE"
+Issues = "https://github.com/Acb897/NILE/issues"
+
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
