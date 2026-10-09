@@ -7,20 +7,36 @@ contacted.
 Both sides are reduced to the same thing: a set of (A, P, B) triples,
 where A is the class of the subject, P the predicate, and B the class of
 the object. A class that cannot be established becomes the wildcard ANY.
+A predicate that is a variable in the query becomes ANY as well.
 A repository is kept as soon as one of its triples is compatible with
-one of the query's, under any of four rules:
+one of the query's, under any of seven rules:
 
     1. Exact             query (A, P, B)   against profile (A, P, B)
     2. Profile gap       query (A, P, *)   against profile (A, P, ANY)
     3. Query gap         query (A, P, ANY) against profile (A, P, B)
     4. Unknown subject   query (ANY, P, *) where P appears anywhere in
                          the profile
+    5. Unknown predicate query (A, ANY, B) against profile (A, *, B)
+                         or (A, *, ANY)
+    6. Subject only      query (A, ANY, ANY) where A appears as a
+                         subject class in the profile
+    7. Object only       query (ANY, ANY, B) where B appears as an
+                         object class in the profile
 
 Rules 2 and 3 are what make the result useful rather than merely
 correct. A missing class means "not known", not "does not occur", so a
 repository is kept whenever it might contribute. The aim is to find
 repositories that could help, not to prove that any one of them could
 answer the query by itself.
+
+Every rule rests on at least one concrete term of the query being found
+in the profile: A and P for rules 1 to 3, P for rule 4, A for rules 5
+and 6, B for rule 7. That is why rule 7 does not accept a profile-side
+ANY object the way rule 5 does -- with subject and predicate both
+unknown, B would then be the only concrete term and it would not be
+consulted, and nearly every profile would match. For the same reason a
+fully unconstrained query pattern, (ANY, ANY, ANY), is not matched at
+all: it carries nothing to select on.
 
 Despite the vocabulary, this is not SHACL validation. Validation asks
 whether a data graph satisfies a set of constraints; here two structural
@@ -179,17 +195,24 @@ def extract_APB_from_query(query_string: str, debug: bool = True) -> List[APBPat
             output.
 
     Returns:
-        A list of (A, P, B) triples of strings, where A and B may be
-        ANY.
+        A list of (A, P, B) triples of strings, where any of A, P and B
+        may be ANY.
 
     Raises:
         Exception: Whatever rdflib raises if the query cannot be parsed.
 
     Note:
-        Patterns with a variable predicate are skipped -- there is
-        nothing there to match a profile against. rdf:type patterns are
-        skipped too, since they supply the typing rather than a
-        relationship of their own.
+        A variable predicate becomes ANY, giving (A, ANY, B),
+        (A, ANY, ANY) or (ANY, ANY, B) for rules 5 to 7. A pattern that
+        would reduce to (ANY, ANY, ANY) -- `?s ?p ?o` with neither end
+        typed -- is skipped, since it has nothing to match a profile
+        against. rdf:type patterns are skipped too, since they supply
+        the typing rather than a relationship of their own.
+
+        Only a concrete rdf:type predicate types a variable. A pattern
+        such as `?x ?p ex:Plant` is read as an unknown relation to the
+        resource ex:Plant, not as a type assertion, even though ?p could
+        bind to rdf:type.
 
         A variable asserted to belong to more than one class carries all
         of them at once, and the triples are taken over every
@@ -234,10 +257,14 @@ def extract_APB_from_query(query_string: str, debug: bool = True) -> List[APBPat
     result: Set[APBPattern] = set()
     for s, p, o in raw:
         if _is_var(p):
+            pred = ANY
+        elif _is_uri(p):
+            if str(p) == RDF_TYPE_STR:
+                continue
+            pred = str(p)
+        else:
+            # Property paths are not URIRefs and are not matched here.
             continue
-        if str(p) == RDF_TYPE_STR:
-            continue
-        pred = str(p)
 
         types_a = list(var_types.get(str(s), set())) if _is_var(s) else []
         if not types_a:
@@ -249,6 +276,8 @@ def extract_APB_from_query(query_string: str, debug: bool = True) -> List[APBPat
 
         for a in types_a:
             for b in types_b:
+                if pred == ANY and a == ANY and b == ANY:
+                    continue  # nothing concrete to select on
                 result.add((a, pred, b))
 
     result_list = list(result)
@@ -277,9 +306,21 @@ class Profile:
         source: The repository the profile describes, from dct:source,
             where it declares one.
         path: The file the profile was read from.
+        subject_classes: Every concrete class in the A position. Rule 6
+            is evaluated against this.
+        object_classes: Every concrete class in the B position. Rule 7
+            is evaluated against this.
+        class_pairs: Every (A, B) pair, B possibly ANY, linked by some
+            predicate. Rule 5 is evaluated against this.
+
+    Note:
+        The three class indexes are derived from `patterns` once, when
+        the profile is built, so they are cached alongside it and rules
+        5 to 7 cost a set lookup per query pattern.
     """
 
-    __slots__ = ("patterns", "paths", "source", "path")
+    __slots__ = ("patterns", "paths", "source", "path",
+                 "subject_classes", "object_classes", "class_pairs")
 
     def __init__(self, patterns, paths, source=None, path=None):
         """Store one abstracted profile.
@@ -294,6 +335,13 @@ class Profile:
         self.paths: Set[str] = paths
         self.source: Optional[str] = source
         self.path: Optional[str] = path
+
+        self.subject_classes: Set[str] = {a for a, _, _ in patterns
+                                          if a != ANY}
+        self.object_classes: Set[str] = {b for _, _, b in patterns
+                                         if b != ANY}
+        self.class_pairs: Set[Tuple[str, str]] = {(a, b) for a, _, b
+                                                  in patterns if a != ANY}
 
 
 def _list_items(g: Graph, node) -> List:
@@ -718,7 +766,7 @@ def shacl_validator(query_string: str, shacl_dir: str,
 
     The query is reduced to its (A, P, B) triples, every profile in
     `shacl_dir` is reduced the same way, and the two are compared under
-    the four rules described in the module docstring. One compatible
+    the seven rules described in the module docstring. One compatible
     pair is enough.
 
     Args:
@@ -756,6 +804,9 @@ def shacl_validator(query_string: str, shacl_dir: str,
         return []
 
     query_pattern_set = set(query_patterns)
+    # Rules 1 to 4 need a concrete predicate; rules 5 to 7 cover the rest.
+    pred_patterns = [t for t in query_patterns if t[1] != ANY]
+    any_pred_patterns = [t for t in query_patterns if t[1] == ANY]
 
     shacl_files = discover_profiles(shacl_dir)
     if debug:
@@ -781,12 +832,12 @@ def shacl_validator(query_string: str, shacl_dir: str,
 
             # Rule 1: exact match (A, P, B) - both ends concrete
             exact_overlap = [
-                (a, p, b) for a, p, b in query_patterns
+                (a, p, b) for a, p, b in pred_patterns
                 if a != ANY and b != ANY and (a, p, b) in shacl_exact
             ]
             # Rule 2: SHACL has (A, P, ANY) - matches any query (A, P, *)
             wildcard_shacl = [
-                (a, p, b) for a, p, b in query_patterns
+                (a, p, b) for a, p, b in pred_patterns
                 if a != ANY and (a, p) in shacl_wildcards
             ]
             # Rule 3: query has (A, P, ANY) - matches SHACL exact (A, P, B)
@@ -796,12 +847,34 @@ def shacl_validator(query_string: str, shacl_dir: str,
             ]
             # Rule 4: query has (ANY, P, *) - matches if P exists in SHACL
             wildcard_any_subj = [
-                (a, p, b) for a, p, b in query_patterns
+                (a, p, b) for a, p, b in pred_patterns
                 if a == ANY and p in shacl_all_paths
+            ]
+            # Rule 5: query has (A, ANY, B) - matches SHACL (A, *, B), or
+            # (A, *, ANY) as in rule 2
+            any_pred_both = [
+                (a, p, b) for a, p, b in any_pred_patterns
+                if a != ANY and b != ANY
+                and ((a, b) in profile.class_pairs
+                     or (a, ANY) in profile.class_pairs)
+            ]
+            # Rule 6: query has (A, ANY, ANY) - matches if A is a subject
+            # class in SHACL
+            any_pred_subj = [
+                (a, p, b) for a, p, b in any_pred_patterns
+                if a != ANY and b == ANY and a in profile.subject_classes
+            ]
+            # Rule 7: query has (ANY, ANY, B) - matches if B is an object
+            # class in SHACL. A profile-side ANY is not accepted here;
+            # see the module docstring.
+            any_pred_obj = [
+                (a, p, b) for a, p, b in any_pred_patterns
+                if a == ANY and b != ANY and b in profile.object_classes
             ]
 
             hit = bool(exact_overlap or wildcard_shacl
-                       or wildcard_query_b or wildcard_any_subj)
+                       or wildcard_query_b or wildcard_any_subj
+                       or any_pred_both or any_pred_subj or any_pred_obj)
 
             if debug:
                 fname = os.path.basename(shacl_file)
@@ -813,6 +886,9 @@ def shacl_validator(query_string: str, shacl_dir: str,
                       f"Rule2 shacl-wc: {len(wildcard_shacl)}  "
                       f"Rule3 query-wc: {len(wildcard_query_b)}  "
                       f"Rule4 any-subj: {len(wildcard_any_subj)}")
+                print(f"  Rule5 any-pred: {len(any_pred_both)}  "
+                      f"Rule6 subj-only: {len(any_pred_subj)}  "
+                      f"Rule7 obj-only: {len(any_pred_obj)}")
                 print(f"  -> {'RESPONSIVE' if hit else 'not responsive'}")
 
             if hit:

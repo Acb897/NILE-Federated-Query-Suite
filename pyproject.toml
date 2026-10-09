@@ -19,6 +19,7 @@ dependencies = [
     "beautifulsoup4>=4.13.4",
     "requests>=2.32.3",
     "rdflib>=7.1.4",
+    "pyoxigraph>=0.5",
     "SPARQLWrapper>=2.0.0"
 ]
 
@@ -42,3 +43,8 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+filterwarnings = [
+    # pyparsing deprecation notices raised inside rdflib's SPARQL parser
+    "ignore::DeprecationWarning:rdflib.*",
+    "ignore::DeprecationWarning:pyparsing.*",
+]

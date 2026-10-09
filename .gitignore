@@ -1,1 +1,6 @@
 *.pyc
+src/nile/scarab/scarab_harvester_OLD_OLD.py
+src/nile/scarab/scarab_harvester_OLD.py
+src/nile/scarab/scarab_harvester_pre_guardrails.py
+examples/test_scarab_OLD.py
+src/nile/riddle/riddle_OLD.py

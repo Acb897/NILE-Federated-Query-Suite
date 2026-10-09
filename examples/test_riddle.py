@@ -80,4 +80,4 @@ def run_tests_on_all_queries(input_dir="./queries", shacl_dir="shacl_output", ou
     print(f"\nDone. Results written to: {os.path.abspath(output_file)}")
 
 
-run_tests_on_all_queries("./NILE-Federated-Query-Suite/examples/queries", "./shacl_output", "batch_test_results_NILE.txt")
+run_tests_on_all_queries("./NILE-Federated-Query-Suite/examples/queries", "./shacl_output", "batch_test_results_NILE_benchmarks.txt")

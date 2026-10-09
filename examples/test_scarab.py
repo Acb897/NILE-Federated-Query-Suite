@@ -1,8 +1,13 @@
 # ==============================
-# Import functions
+# SCARAB example: harvest a query, then answer it over what was harvested
 # ==============================
 
-from nile.scarab.scarab_harvester import FindBGPPriority, execute_sparql_query, fetch_tpf_page
+import logging
+
+from nile.scarab import scarab_harvester as scarab
+
+# SCARAB reports its progress through the "nile.scarab" logger.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
 # ==============================
@@ -30,7 +35,7 @@ from nile.scarab.scarab_harvester import FindBGPPriority, execute_sparql_query, 
 #    ?enzyme <http://bio2rdf.org/ns/kegg#xSubstrate> ?cpd .
 #    ?enzyme <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://bio2rdf.org/ns/kegg#Enzyme> .
 #    ?reaction <http://bio2rdf.org/ns/kegg#xEnzyme> ?enzyme .
-#    ?reaction <http://bio2rdf.org/ns/kegg#equation> ?equation . 
+#    ?reaction <http://bio2rdf.org/ns/kegg#equation> ?equation .
 # }
 # """
 
@@ -38,66 +43,81 @@ query = """
 SELECT ?enzyme ?reaction ?equation WHERE {
    ?enzyme <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://bio2rdf.org/ns/kegg#Enzyme> .
    ?reaction <http://bio2rdf.org/ns/kegg#xEnzyme> ?enzyme .
-   ?reaction <http://bio2rdf.org/ns/kegg#equation> ?equation . 
+   ?reaction <http://bio2rdf.org/ns/kegg#equation> ?equation .
 }
 """
+
+# query = """
+# PREFIX rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+# PREFIX bench: <http://localhost/vocabulary/bench/>
+# PREFIX swrc:  <http://swrc.ontoware.org/ontology#>
+
+# SELECT ?article
+# WHERE {
+#   ?article rdf:type bench:Article .
+#   ?article ?property ?value
+#   FILTER (?property=swrc:month)
+# }
+# """
 
 # ==============================
 # CONFIGURATION
 # ==============================
 
-named_graph_iri = "http://example.org/graphs/federated-temp"
-
-# Provide ONE or MANY endpoints
-tpf_servers = [
-    "http://localhost:3000/kegg-sparql",
-    # Add more endpoints here
-    # "https://example.org/endpointA",
-    # "https://example.org/endpointB"
+# One or more sources. Declare the kind of each one explicitly:
+#   "qpf:" or "tpf:"  a fragments server
+#   "sparql:"         a SPARQL endpoint
+#   "dump:"           an RDF file
+sources = [
+    "qpf:http://localhost:3000/kegg-sparql",
+    # "qpf:http://localhost:3000/sp2bench-sparql",
+    # "sparql:http://localhost:9999/blazegraph/namespace/kegg/sparql",
+    # "dump:/data/caresm-diagnosis.nq",
 ]
 
-# Ensure it's always an array
-if not isinstance(tpf_servers, list):
-    tpf_servers = [tpf_servers]
+# Where harvests are published and the query is evaluated.
+scarab.configure(
+    store_kind="remote",                    # or "local" for an embedded store (no GraphDB needed)
+    store_base="http://acb8computer:7200",
+    store_repository="test1",
+    # export_dir="./harvests",              # also write each source's nanopublication as TriG
+)
 
 
 # ==============================
-# FEDERATED HARVEST PHASE
+# HARVEST PHASE
 # ==============================
+# One call for all the sources. Each source is still harvested in isolation,
+# into its own assertion graph, and the graphs of this run are returned.
 
-print("=======================================")
-print("Starting Federated Harvest")
-print("=======================================")
+graphs = scarab.FindBGPPriority(query, sources)
 
-for endpoint in tpf_servers:
+print("\nAssertion graphs of this run:")
+for graph in graphs:
+    print("  ", graph)
 
-    print(f"\n--- Checking endpoint: {endpoint} ---")
-
-    try:
-        # This function should:
-        # - Detect matching triple patterns
-        # - Harvest triples
-        # - Insert them into local GraphDB
-        FindBGPPriority(query, endpoint)
-
-    except Exception as e:
-        print(f"Error processing endpoint {endpoint}: {e}")
+print("\nPer-source statistics:")
+for stats in scarab.last_run_stats():
+    decisions = [p["decision"] for p in stats["patterns"]]
+    print(f"  {stats['source']}: {stats['requests']} requests, "
+          f"{stats['triples_stored']} triples stored, {stats['seconds']} s, "
+          f"patterns retrieved as {decisions}")
 
 
 # ==============================
-# LOCAL QUERY EXECUTION PHASE
+# EVALUATION PHASE
 # ==============================
+# The query is answered over this run's assertion graphs only: neither the
+# provenance graphs nor the data of earlier runs can leak into the answer.
 
-print("\n=======================================")
-print("Executing query over local GraphDB")
-print("=======================================")
-
-results = execute_sparql_query(query)
+results = scarab.evaluate_over_run(query, graphs)
 
 print("\nResults:")
 print(results)
 
-# # Test call in main.py or separately
-# test_url = "http://localhost:3000/kegg-sparql?subject=http%3A%2F%2Fbio2rdf.org%2Fcpd%3AC00006"
-# g = fetch_tpf_page(test_url)
-# print("Test parse result:", len(g))
+# The same in one step:
+# results = scarab.answer_query(query, sources)
+
+# Harvests exported with export_dir can be combined and answered later:
+# import glob
+# results = scarab.evaluate_harvest_files(query, glob.glob("./harvests/*.trig"))
