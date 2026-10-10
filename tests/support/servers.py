@@ -82,6 +82,8 @@ class _FragmentsHandler(BaseHTTPRequestHandler):
             time.sleep(srv.latency)
         parsed = urlparse(self.path)
         params = {k: v[0] for k, v in parse_qs(parsed.query, keep_blank_values=True).items()}
+        if srv.request_filter:
+            params = {k: srv.request_filter(v) for k, v in params.items()}
         page = int(params.get("page", "1") or 1)
         selector = tuple(params.get(k) for k in ("subject", "predicate", "object", "graph"))
         matches = srv.matches(selector)
@@ -94,7 +96,7 @@ class _FragmentsHandler(BaseHTTPRequestHandler):
         quads = []
         for s, p, o, g in chunk:
             quads.append(ox.Quad(s, p, o, g if g is not None else ox.DefaultGraph()))
-        total = ox.Literal(str(len(matches)), datatype=ox.NamedNode("http://www.w3.org/2001/XMLSchema#integer"))
+        total = ox.Literal(str(srv.reported_total or len(matches)), datatype=ox.NamedNode("http://www.w3.org/2001/XMLSchema#integer"))
         for subject in {url, fragment}:
             quads.append(ox.Quad(ox.NamedNode(subject), ox.NamedNode(HYDRA + "totalItems"), total, meta))
             quads.append(ox.Quad(ox.NamedNode(subject), ox.NamedNode(VOID + "triples"), total, meta))
@@ -104,9 +106,15 @@ class _FragmentsHandler(BaseHTTPRequestHandler):
             nxt = dict(fragment_params, page=str(page + 1))
             quads.append(ox.Quad(ox.NamedNode(url), ox.NamedNode(HYDRA + "next"),
                                  ox.NamedNode(f"{srv.base}{parsed.path}?{urlencode(nxt)}"), meta))
-        body = ox.serialize(quads, format=ox.RdfFormat.TRIG)
+        line_based = self.headers.get("Accept", "").startswith("application/n-quads")
+        if line_based and srv.serve_nquads:
+            body, content_type = ox.serialize(quads, format=ox.RdfFormat.N_QUADS), "application/n-quads"
+        else:
+            body, content_type = ox.serialize(quads, format=ox.RdfFormat.TRIG), "application/trig"
+        if srv.body_filter:
+            body = srv.body_filter(page, content_type, body)
         self.send_response(200)
-        self.send_header("Content-Type", "application/trig")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -115,9 +123,20 @@ class _FragmentsHandler(BaseHTTPRequestHandler):
 class FragmentsServer(_Server):
     """A Quad Pattern Fragments server over a pyoxigraph store."""
 
-    def __init__(self, store, page_size=100, latency=0.0):
+    def __init__(self, store, page_size=100, latency=0.0, reported_total=None,
+                 body_filter=None, request_filter=None, serve_nquads=True):
         super().__init__(_FragmentsHandler)
+        # Hooks for imitating malformed responses: `body_filter(page,
+        # content_type, body)` rewrites a serialized page before it is sent,
+        # and `request_filter(value)` maps each selector value back before
+        # matching (so a request may name a term as the broken output spells it).
+        self.body_filter = body_filter
+        self.request_filter = request_filter
+        self.serve_nquads = serve_nquads
         self.store = store
+        # A fixed count to report instead of the real one, e.g. 1_000_000_000
+        # to imitate the LDF server's placeholder after a count timeout.
+        self.reported_total = reported_total
         self.page_size = page_size
         self.latency = latency
         self._cache = OrderedDict()
@@ -206,7 +225,12 @@ class _SparqlHandler(BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         if parsed.path.endswith("/statements"):
-            srv.store.load(input=body, format=ox.RdfFormat.N_QUADS)
+            ctype = self.headers.get("Content-Type", "")
+            if ctype.startswith("application/x-www-form-urlencoded"):
+                # A SPARQL Update sent as a form, as with GraphDB's statements route.
+                srv.store.update(parse_qs(body.decode("utf-8")).get("update", [""])[0])
+            else:
+                srv.store.load(input=body, format=ox.RdfFormat.N_QUADS)
             return self._reply(204, b"", "text/plain")
         ctype = self.headers.get("Content-Type", "")
         if ctype.startswith("application/x-www-form-urlencoded"):

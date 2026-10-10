@@ -39,26 +39,26 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 # }
 # """
 
-query = """
-SELECT ?enzyme ?reaction ?equation WHERE {
-   ?enzyme <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://bio2rdf.org/ns/kegg#Enzyme> .
-   ?reaction <http://bio2rdf.org/ns/kegg#xEnzyme> ?enzyme .
-   ?reaction <http://bio2rdf.org/ns/kegg#equation> ?equation .
-}
-"""
-
 # query = """
-# PREFIX rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-# PREFIX bench: <http://localhost/vocabulary/bench/>
-# PREFIX swrc:  <http://swrc.ontoware.org/ontology#>
-
-# SELECT ?article
-# WHERE {
-#   ?article rdf:type bench:Article .
-#   ?article ?property ?value
-#   FILTER (?property=swrc:month)
+# SELECT ?enzyme ?reaction ?equation WHERE {
+#    ?enzyme <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://bio2rdf.org/ns/kegg#Enzyme> .
+#    ?reaction <http://bio2rdf.org/ns/kegg#xEnzyme> ?enzyme .
+#    ?reaction <http://bio2rdf.org/ns/kegg#equation> ?equation .
 # }
 # """
+
+query = """
+PREFIX rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX bench: <http://localhost/vocabulary/bench/>
+PREFIX swrc:  <http://swrc.ontoware.org/ontology#>
+
+SELECT ?article
+WHERE {
+  ?article rdf:type bench:Article .
+  ?article ?property ?value
+  FILTER (?property=swrc:month)
+}
+"""
 
 # ==============================
 # CONFIGURATION
@@ -69,8 +69,8 @@ SELECT ?enzyme ?reaction ?equation WHERE {
 #   "sparql:"         a SPARQL endpoint
 #   "dump:"           an RDF file
 sources = [
-    "qpf:http://localhost:3000/kegg-sparql",
-    # "qpf:http://localhost:3000/sp2bench-sparql",
+    # "qpf:http://localhost:3000/kegg-sparql",
+    "qpf:http://localhost:3000/sp2bench-sparql",
     # "sparql:http://localhost:9999/blazegraph/namespace/kegg/sparql",
     # "dump:/data/caresm-diagnosis.nq",
 ]

@@ -1247,7 +1247,8 @@ class HarvestStats:
     """Counters for one source's harvest. Thread-safe."""
 
     _FIELDS = ("requests", "pages", "bytes", "cache_hits", "errors",
-               "triples_received", "triples_ingested")
+               "triples_received", "triples_ingested", "iris_rewritten",
+               "triples_dropped")
 
     def __init__(self, source_label):
         self.source = source_label
@@ -1291,7 +1292,8 @@ def last_run_stats():
     received from the source, ingested into its working store, and stored
     in its assertion graph; the time spent; per pattern, how it was
     retrieved ("full", "full+filter", "bind", "empty", "path", "skipped" in
-    strict mode, or "skipped-dump" for a forced dump that was not performed);
+    strict mode, "skipped-dump" for a forced dump that was not performed, or
+    "reused" for a pattern whose fragment an earlier pattern retrieved in full);
     and whether the harvest declared itself incomplete because of such a skip.
     """
     return [s.as_dict() for s in _LAST_RUN_STATS]
@@ -1326,7 +1328,10 @@ def _session():
 # FRAGMENT PAGES
 # -------------------------------------------------------------------------
 
-Page = namedtuple("Page", ["data", "total", "per_page", "next_url", "ok"])
+# `dropped`: statements of the page that could not be read, so that a page
+# shortened by them is not mistaken for the last page of its fragment.
+Page = namedtuple("Page", ["data", "total", "per_page", "next_url", "ok", "dropped"],
+                  defaults=(0,))
 
 _FORMATS = {
     "application/trig": ox.RdfFormat.TRIG,
@@ -1339,6 +1344,7 @@ _FORMATS = {
 }
 _ACCEPT = ("application/trig;q=1.0, application/n-quads;q=0.9, "
            "text/turtle;q=0.8, application/n-triples;q=0.7")
+_LINE_ACCEPT = "application/n-quads;q=1.0, application/n-triples;q=0.9"
 
 
 class _PageCache:
@@ -1381,15 +1387,131 @@ def _is_control(quad, control_prefix):
     return isinstance(subject, ox.NamedNode) and subject.value.startswith(control_prefix)
 
 
+# Code points an IRI may not contain (RFC 3987, and the IRIREF production of
+# Turtle and N-Triples): controls, space, and <>"{}|^`\ .
+_IRI_FORBIDDEN = re.compile(r'[\x00-\x20<>"{}|^`\\\x7f-\x9f]')
+_LINE_FORMATS = (ox.RdfFormat.N_QUADS, ox.RdfFormat.N_TRIPLES)
+
+
+class ParsedPage(namedtuple("ParsedPage", ["quads", "rewritten", "dropped"])):
+    """Quads parsed from a response, with how many IRIs had to be rewritten
+    and how many statements could not be read at all."""
+
+
+def _rewrite_iri(value):
+    """Percent-encode the code points that make an IRI invalid.
+
+    This is the mapping RFC 3987 (section 3.1) prescribes from an IRI to a
+    URI, applied only to the offending code points, so a valid IRI is left
+    unchanged and the same invalid IRI is always rewritten the same way.
+    """
+    return _IRI_FORBIDDEN.sub(
+        lambda m: "".join(f"%{b:02X}" for b in m.group().encode("utf-8")), value)
+
+
+# Rewritten IRI -> the IRI as the source spells it. A rewritten IRI used as
+# a constant in a later request (a bind join on it) must be sent back to the
+# source in its original form, or the source would not recognise it.
+_ORIGINAL_IRIS = {}
+
+
+def _valid_iri(value):
+    try:
+        ox.NamedNode(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _repair_term(term, counter):
+    """Return `term` with invalid IRIs rewritten; None if it cannot be repaired."""
+    if isinstance(term, ox.NamedNode):
+        if _valid_iri(term.value):
+            return term
+        fixed = _rewrite_iri(term.value)
+        if not _valid_iri(fixed):
+            return None
+        counter[0] += 1
+        _ORIGINAL_IRIS[fixed] = term.value
+        return ox.NamedNode(fixed)
+    if isinstance(term, ox.Literal) and term.language is None:
+        datatype = _repair_term(term.datatype, counter)
+        if datatype is None:
+            return None
+        if datatype is not term.datatype:
+            return ox.Literal(term.value, datatype=datatype)
+    return term
+
+
+def _repair_quads(quads):
+    """Rewrite invalid IRIs in leniently parsed quads; drop what cannot be fixed."""
+    counter, out, dropped = [0], [], 0
+    for q in quads:
+        terms = [_repair_term(t, counter) for t in (q.subject, q.predicate, q.object)]
+        graph = q.graph_name
+        if isinstance(graph, ox.NamedNode):
+            graph = _repair_term(graph, counter)
+        if any(t is None for t in terms) or graph is None:
+            dropped += 1
+            continue
+        if terms[0] is q.subject and terms[1] is q.predicate and terms[2] is q.object \
+                and graph is q.graph_name:
+            out.append(q)
+        else:
+            out.append(ox.Quad(*terms, graph))
+    return out, counter[0], dropped
+
+
+def _parse_lines(body, fmt, base_iri):
+    """Parse a line-based response one statement at a time.
+
+    A line that cannot be read even leniently is dropped and counted, so a
+    single malformed statement costs that statement rather than the page.
+    """
+    quads, dropped = [], 0
+    for line in body.splitlines():
+        text = line.strip()
+        if not text or text.startswith(b"#"):
+            continue
+        try:
+            quads.extend(ox.parse(line + b"\n", format=fmt, base_iri=base_iri, lenient=True))
+        except Exception:
+            dropped += 1
+    return quads, dropped
+
+
 def _parse_body(body, content_type, base_iri):
+    """Parse a response, tolerating malformed IRIs.
+
+    Strict parsing is tried first. If it fails, the body is parsed leniently
+    and every IRI the strict parser would have rejected is rewritten (see
+    `_rewrite_iri`); a line-based response that still fails is parsed one
+    statement at a time. Raises ValueError if nothing works, which the
+    caller may answer by asking for a line-based serialization instead.
+
+    Returns:
+        A ParsedPage.
+    """
     fmt = _FORMATS.get((content_type or "").split(";")[0].strip().lower())
     attempts = [fmt] if fmt else [ox.RdfFormat.TRIG, ox.RdfFormat.N_QUADS,
                                   ox.RdfFormat.TURTLE, ox.RdfFormat.RDF_XML]
     for f in attempts:
         try:
-            return list(ox.parse(body, format=f, base_iri=base_iri))
+            return ParsedPage(list(ox.parse(body, format=f, base_iri=base_iri)), 0, 0)
         except Exception:
             continue
+    for f in attempts:
+        try:
+            quads = list(ox.parse(body, format=f, base_iri=base_iri, lenient=True))
+        except Exception:
+            continue
+        quads, rewritten, dropped = _repair_quads(quads)
+        return ParsedPage(quads, rewritten, dropped)
+    for f in attempts:
+        if f in _LINE_FORMATS:
+            quads, dropped = _parse_lines(body, f, base_iri)
+            quads, rewritten, more = _repair_quads(quads)
+            return ParsedPage(quads, rewritten, dropped + more)
     raise ValueError(f"unparseable response ({content_type})")
 
 
@@ -1458,12 +1580,29 @@ def _fetch_tpf_page(url, control_prefix=None, stats=None):
         if stats:
             stats.add(requests=1, pages=1, bytes=len(resp.content))
         resp.raise_for_status()
-        quads = _parse_body(resp.content, resp.headers.get("Content-Type"), url)
+        try:
+            parsed = _parse_body(resp.content, resp.headers.get("Content-Type"), url)
+        except ValueError as first:
+            # The preferred serialization could not be read even leniently.
+            # Ask for a line-based one, where a malformed statement costs
+            # only itself.
+            logger.warning("Could not parse %s (%s); retrying as N-Quads", url, first)
+            resp = _session().get(url, headers={"Accept": _LINE_ACCEPT}, timeout=HTTP_TIMEOUT)
+            if stats:
+                stats.add(requests=1, bytes=len(resp.content))
+            resp.raise_for_status()
+            parsed = _parse_body(resp.content, resp.headers.get("Content-Type"), url)
     except Exception as e:
         logger.warning("Fetch failed for %s: %s", url, e)
         if stats:
             stats.add(errors=1)
         return Page([], None, None, None, False)
+    quads = parsed.quads
+    if parsed.rewritten or parsed.dropped:
+        logger.warning("%s: %d invalid IRIs rewritten, %d statements unreadable",
+                       url, parsed.rewritten, parsed.dropped)
+        if stats:
+            stats.add(iris_rewritten=parsed.rewritten, triples_dropped=parsed.dropped)
 
     own_counts, other_counts = [], []
     per_page, next_url, data = None, None, []
@@ -1485,7 +1624,7 @@ def _fetch_tpf_page(url, control_prefix=None, stats=None):
             data.append(q)
 
     total = own_counts[0] if own_counts else (min(other_counts) if other_counts else None)
-    page = Page(data, total, per_page, next_url, True)
+    page = Page(data, total, per_page, next_url, True, parsed.dropped)
     page_cache.put(url, page)
     return page
 
@@ -1499,14 +1638,10 @@ def tpf_uri_request_builder(control_uri, subject, predicate, object_, graph=None
     Fragments request; leaving it out keeps it an ordinary TPF request.
     """
     params = {}
-    if subject is not None and not subject.startswith("?"):
-        params["subject"] = subject
-    if predicate is not None and not predicate.startswith("?"):
-        params["predicate"] = predicate
-    if object_ is not None and not object_.startswith("?"):
-        params["object"] = object_
-    if graph is not None and not graph.startswith("?"):
-        params["graph"] = graph
+    for name, value in (("subject", subject), ("predicate", predicate),
+                        ("object", object_), ("graph", graph)):
+        if value is not None and not value.startswith("?"):
+            params[name] = _ORIGINAL_IRIS.get(value, value)
     if params:
         sep = "&" if "?" in control_uri else "?"
         return f"{control_uri}{sep}{urlencode(params)}"
@@ -1697,7 +1832,7 @@ class TPFDataSource(DataSource):
                     yield q.subject, q.predicate, q.object
             if stats:
                 stats.add(triples_received=n)
-            raw = len(page.data)
+            raw = len(page.data) + page.dropped
             if raw == 0 or (page.per_page and raw < page.per_page):
                 return
             url = page.next_url
@@ -2007,6 +2142,29 @@ class WorkingStore:
 # HARVESTING ONE SOURCE
 # -------------------------------------------------------------------------
 
+def fragment_covers(full, pat):
+    """Return True if retrieving `full` completely stored everything `pat` matches.
+
+    A pattern whose positions are distinct variables wherever they are not
+    constants, once retrieved in full, has put every triple of its fragment
+    in the working store. Any later pattern that agrees with it on those
+    constants (whatever its variable names, and even with more positions
+    bound or a variable repeated) matches only triples among them, and needs
+    no request. Both must address the same graph (or none).
+    """
+    if is_path_pattern(full) or is_path_pattern(pat):
+        return False
+    f_graph, p_graph = full.get("graph"), pat.get("graph")
+    if not ((f_graph is None or f_graph.startswith("?")) and (p_graph is None or p_graph.startswith("?"))) \
+            and f_graph != p_graph:
+        return False
+    fields = ("subject", "predicate", "object")
+    variables = [full[f] for f in fields if full[f].startswith("?")]
+    if len(variables) != len(set(variables)):
+        return False
+    return all(full[f].startswith("?") or full[f] == pat[f] for f in fields)
+
+
 def _key_positions(pat, var_names):
     """Map each restricted variable to the first position it occupies."""
     fields = ("subject", "predicate", "object")
@@ -2027,6 +2185,8 @@ class _SourceHarvest:
         self.complete_predicates = set()
         self.ready_paths = set()     # path patterns usable as restrictors
         self.skipped_dumps = []      # all-variable patterns not retrieved
+        self.incomplete = {}         # pattern index -> why its retrieval is partial
+        self.full_fragments = []     # patterns whose whole fragment is stored
 
     # -- restrictions -----------------------------------------------------
     def _restrictor_ok(self, j):
@@ -2114,8 +2274,19 @@ class _SourceHarvest:
         pat = self.bgp[idx]
         count = self.counts.get(idx, 0)
         record = {"index": idx, "pattern": _pattern_label(pat), "estimate": count}
+        cover = next((j for j in self.full_fragments if fragment_covers(self.bgp[j], pat)), None)
+        if cover is not None:
+            # Its whole fragment (or a superset) is already stored: retrieving
+            # it again would add nothing.
+            record.update(decision="reused", reused_from=cover, triples=0, requests=0)
+            self.stats.patterns.append(record)
+            logger.info("  pattern %d %s: reused, already retrieved in full as pattern %d",
+                        idx, record["pattern"], cover)
+            return
+
         plan, keys = self._bindings(idx)
         requests_before = self.stats.requests
+        errors_before, dropped_before = self.stats.errors, self.stats.triples_dropped
 
         if plan is not None and keys is None:
             # Every binding was impossible for this pattern's positions: the
@@ -2160,12 +2331,30 @@ class _SourceHarvest:
 
         record.update(decision=decision, triples=n,
                       requests=self.stats.requests - requests_before)
+        failed = self.stats.errors - errors_before
+        dropped = self.stats.triples_dropped - dropped_before
+        if failed or dropped:
+            # Part of the fragment was not obtained: say so rather than
+            # presenting a truncated fragment as complete.
+            reasons = []
+            if failed:
+                reasons.append(f"{failed} request(s) failed or returned an unreadable page")
+            if dropped:
+                reasons.append(f"{dropped} statement(s) could not be parsed")
+            reason = "; ".join(reasons)
+            self.incomplete[idx] = reason
+            self.stats.declared_incomplete = True
+            record["incomplete"] = reason
+            logger.warning("  pattern %d %s: retrieved incompletely from %s (%s)",
+                           idx, record["pattern"], self.source.location, reason)
         self.stats.patterns.append(record)
+        if decision == "full" and idx not in self.incomplete:
+            self.full_fragments.append(idx)
         logger.info("  pattern %d %s: %s, %d triples, %d requests",
                     idx, record["pattern"], decision, n, record["requests"])
 
         graph = pat.get("graph")
-        if (decision == "full" and pat["subject"].startswith("?")
+        if (decision == "full" and idx not in self.incomplete and pat["subject"].startswith("?")
                 and pat["object"].startswith("?") and pat["subject"] != pat["object"]
                 and not pat["predicate"].startswith("?")
                 and (graph is None or graph.startswith("?"))):
@@ -2283,7 +2472,8 @@ def _pattern_label(pat):
 SCARAB_VOCAB = Namespace(f"{SCARAB_CODEBASE_URI}/vocabulary#")
 
 
-def nanopub_quads(nanopub_base, source, bgp, started_at, ended_at, skipped=()):
+def nanopub_quads(nanopub_base, source, bgp, started_at, ended_at, skipped=(),
+                  incomplete=None, iris_rewritten=0):
     """Build the head, provenance and publication-information graphs.
 
     A nanopublication is four named graphs sharing a base IRI: a head naming
@@ -2296,6 +2486,11 @@ def nanopub_quads(nanopub_base, source, bgp, started_at, ended_at, skipped=()):
     (`skipped`, their indices), the provenance graph says so: each such
     pattern is linked to the source with scarab:notRetrievedFrom, with the
     reason, and the assertion graph is marked scarab:declaredIncomplete.
+    The same holds for patterns retrieved only in part (`incomplete`, index
+    to reason) because a request failed or a page could not be read; those
+    are linked with scarab:incompletelyRetrievedFrom. When invalid IRIs in
+    the source's data were rewritten (`iris_rewritten`), the assertion graph
+    records how many.
 
     Returns:
         (subject, predicate, object, graph) tuples of rdflib terms.
@@ -2351,9 +2546,23 @@ def nanopub_quads(nanopub_base, source, bgp, started_at, ended_at, skipped=()):
                     "may restrict it yielded no bindings at this source, so retrieving "
                     "it would have retrieved the whole repository"), prov_g),
             ]
-    if skipped:
+        if incomplete and i in incomplete:
+            quads += [
+                (pat_node, SCARAB_VOCAB.incompletelyRetrievedFrom, endpoint, prov_g),
+                (pat_node, SCARAB_VOCAB.skipReason, Literal(incomplete[i]), prov_g),
+            ]
+    if skipped or incomplete:
         quads.append((assertion_g, SCARAB_VOCAB.declaredIncomplete,
                       Literal(True, datatype=XSD.boolean), prov_g))
+    if iris_rewritten:
+        quads += [
+            (assertion_g, SCARAB_VOCAB.rewrittenIRIs,
+             Literal(iris_rewritten, datatype=XSD.integer), prov_g),
+            (assertion_g, RDFS.comment, Literal(
+                "IRIs that are invalid under RFC 3987 were received from the source; "
+                "the offending code points were percent-encoded (RFC 3987, section 3.1)"),
+             prov_g),
+        ]
     quads += [
         (SCARAB_CODEBASE_URI, RDF.type, PROV.SoftwareAgent, prov_g),
         (SCARAB_CODEBASE_URI, RDFS.label, Literal("SCARAB TPF Federated Harvester"), prov_g),
@@ -2370,11 +2579,12 @@ def nanopub_quads(nanopub_base, source, bgp, started_at, ended_at, skipped=()):
     return quads
 
 
-def write_nanopub_graphs(working_store, source, bgp, started_at, ended_at, skipped=()):
+def write_nanopub_graphs(working_store, source, bgp, started_at, ended_at, skipped=(),
+                         incomplete=None, iris_rewritten=0):
     """Add the provenance wrapper of a finished harvest to its working store."""
     quads = [ox.Quad(*(ox_from_rdflib(t) for t in q))
              for q in nanopub_quads(working_store.base, source, bgp, started_at, ended_at,
-                                    skipped)]
+                                    skipped, incomplete, iris_rewritten)]
     working_store.store.extend(quads)
 
 
@@ -2487,7 +2697,8 @@ def harvest_endpoint_optimized(source, bgp, nanopub_base, *, strict=None,
         harvest.run()
         ended_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         write_nanopub_graphs(harvest.ws, source, bgp, started_at, ended_at,
-                             skipped=harvest.skipped_dumps)
+                             skipped=harvest.skipped_dumps, incomplete=harvest.incomplete,
+                             iris_rewritten=stats.iris_rewritten)
         if publish:
             t0 = time.perf_counter()
             exported = publish_harvest(harvest.ws)

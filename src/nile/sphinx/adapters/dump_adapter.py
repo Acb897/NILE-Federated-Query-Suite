@@ -1,7 +1,7 @@
 """Indexing a repository from a downloadable RDF file."""
 
 from collections import defaultdict
-from rdflib import Graph, URIRef
+from rdflib import Dataset, URIRef
 
 
 
@@ -17,15 +17,18 @@ class RDFDumpAdapter:
     Because everything is held in memory, the practical limit is the
     size of the file rather than the time exploration takes.
 
-    Everything the file contains is reported as living in the default
-    graph. Named graphs in a quad-based file are not distinguished --
-    that distinction only matters for SPARQL endpoints, which
-    `SPARQLAdapter` handles.
+    Everything the file contains is read, including the triples of every
+    named graph in a quad-based file (TriG, N-Quads), and all of it is
+    reported as living in the default graph. Which named graph a triple
+    came from is not distinguished -- that distinction only matters for
+    SPARQL endpoints, which `SPARQLAdapter` handles. A triple asserted in
+    more than one graph is indexed once.
 
     See `nile.sphinx.adapters` for the contract the adapters share.
 
     Attributes:
-        graph: The parsed rdflib Graph.
+        graph: The parsed rdflib Dataset, read as the union of its
+            default graph and all of its named graphs.
         type_index: Entity IRI -> the set of classes it is typed with.
             Only classes that are themselves IRIs are recorded.
         spo_index: Subject -> list of (predicate, object) pairs.
@@ -48,7 +51,12 @@ class RDFDumpAdapter:
                 producing an empty index.
         """
 
-        self.graph = Graph()
+        # A plain rdflib Graph silently drops every triple that a TriG or
+        # N-Quads file places in a named graph, which for a dataset
+        # distributed with one named graph per record (CARE-SM, for
+        # instance) is nearly all of it. A Dataset keeps them, and with
+        # default_union=True it is iterated as the union of all graphs.
+        self.graph = Dataset(default_union=True)
         self.graph.parse(file_path)
 
         # type_index: entity IRI -> set of class IRIs (rdf:type objects
@@ -58,7 +66,7 @@ class RDFDumpAdapter:
         self.spo_index = defaultdict(list)
         self.pos_index = defaultdict(list)
 
-        for s, p, o in self.graph:
+        for s, p, o in self.graph.triples((None, None, None)):
 
             # Decide URI-vs-blank-node/literal from the actual rdflib term
             # *before* stringifying, so a blank node is never mistaken for
